@@ -275,6 +275,30 @@ def safe_secret(key: str, default=None):
         return default
 
 
+def nested_secret(section: str, key: str, default=None):
+    """Lee valores anidados de st.secrets sin romper la app si no existen."""
+    try:
+        sec = st.secrets.get(section, None)
+        if sec is None:
+            return default
+        return sec.get(key, default)
+    except Exception:
+        return default
+
+
+def exception_detail(exc: Exception) -> str:
+    """Devuelve un detalle útil de errores gspread/APIError para mostrar en pantalla."""
+    parts = [str(exc)]
+    response = getattr(exc, "response", None)
+    if response is not None:
+        try:
+            parts.append(f"status={getattr(response, 'status_code', '')}")
+            parts.append(response.text[:900])
+        except Exception:
+            pass
+    return " | ".join([p for p in parts if p])
+
+
 def as_bool(value, default: bool = False) -> bool:
     """Convierte valores de st.secrets a booleano de forma segura.
 
@@ -422,12 +446,18 @@ class GoogleSheetsStorage:
             from google.oauth2.service_account import Credentials
         except ImportError as exc:
             raise RuntimeError("Falta instalar gspread y google-auth para usar Google Sheets.") from exc
+        self.gspread = gspread
 
-        sheet_id_raw = safe_secret("GOOGLE_SHEET_ID", "")
+        # Soporta la estructura oficial de esta app y, como respaldo, los nombres que
+        # algunas guías usan: [google_service_account] y [google_sheets].
+        sheet_id_raw = safe_secret("GOOGLE_SHEET_ID", "") or nested_secret("google_sheets", "spreadsheet_id", "")
         sheet_id = extract_google_sheet_id(sheet_id_raw)
-        creds_info = safe_secret("gcp_service_account", None)
+        creds_info = safe_secret("gcp_service_account", None) or safe_secret("google_service_account", None)
         if not sheet_id or not creds_info:
-            raise RuntimeError("No se encontró GOOGLE_SHEET_ID o gcp_service_account en los secretos de Streamlit.")
+            raise RuntimeError(
+                "No se encontró GOOGLE_SHEET_ID/gcp_service_account en Secrets. "
+                "También se acepta [google_sheets].spreadsheet_id y [google_service_account] como respaldo."
+            )
 
         creds_dict = normalize_service_account_info(creds_info)
         client_email = clean_str(creds_dict.get("client_email", ""))
@@ -446,7 +476,16 @@ class GoogleSheetsStorage:
         ]
         credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         client = gspread.authorize(credentials)
-        self.book = client.open_by_key(sheet_id)
+        try:
+            self.book = client.open_by_key(sheet_id)
+            # Forzar lectura de metadata aquí para detectar permisos/ID antes de cargar datos.
+            _ = self.book.worksheets()
+        except Exception as exc:
+            raise RuntimeError(
+                "No se pudo abrir el Google Sheet indicado. "
+                f"Detalle API: {exception_detail(exc)}. "
+                f"Revisión: {diagnose_gsheets_error(exc)}"
+            ) from exc
         self.ensure_database()
 
     def ensure_database(self) -> None:
@@ -474,44 +513,84 @@ class GoogleSheetsStorage:
                     if current_header[:len(columns)] != columns:
                         ws.update(values=[columns], range_name="A1", value_input_option="USER_ENTERED")
 
+    def worksheet_or_create(self, sheet: str):
+        try:
+            return self.book.worksheet(sheet)
+        except Exception as exc:
+            # Si la conexión existe pero falta una pestaña, intentamos crearla.
+            # Si el error es de permisos/ID/API, se muestra un diagnóstico claro.
+            detail = exception_detail(exc)
+            low = detail.lower()
+            if "not found" in low or "worksheetnotfound" in low:
+                ws = self.book.add_worksheet(title=sheet, rows=1000, cols=max(len(SHEET_COLUMNS[sheet]), 10))
+                ws.update(values=[SHEET_COLUMNS[sheet]], range_name="A1", value_input_option="USER_ENTERED")
+                return ws
+            raise RuntimeError(
+                f"No se pudo acceder a la pestaña '{sheet}' del Google Sheet. "
+                f"Detalle API: {detail}. Revisión: {diagnose_gsheets_error(exc)}"
+            ) from exc
+
     def load(self, sheet: str) -> pd.DataFrame:
-        ws = self.book.worksheet(sheet)
-        records = ws.get_all_records()
+        ws = self.worksheet_or_create(sheet)
+        try:
+            records = ws.get_all_records()
+        except Exception as exc:
+            raise RuntimeError(
+                f"No se pudo leer la pestaña '{sheet}'. Detalle API: {exception_detail(exc)}. "
+                f"Revisión: {diagnose_gsheets_error(exc)}"
+            ) from exc
         df = pd.DataFrame(records)
         return ensure_columns(df, sheet)
 
     def save(self, sheet: str, df: pd.DataFrame) -> None:
-        ws = self.book.worksheet(sheet)
+        ws = self.worksheet_or_create(sheet)
         df = normalize_for_sheet(ensure_columns(df, sheet))
-        ws.clear()
-        values = [SHEET_COLUMNS[sheet]] + df.values.tolist()
-        ws.update(values=values, range_name="A1", value_input_option="USER_ENTERED")
+        try:
+            ws.clear()
+            values = [SHEET_COLUMNS[sheet]] + df.values.tolist()
+            ws.update(values=values, range_name="A1", value_input_option="USER_ENTERED")
+        except Exception as exc:
+            raise RuntimeError(
+                f"No se pudo guardar la pestaña '{sheet}'. Detalle API: {exception_detail(exc)}. "
+                f"Revisión: {diagnose_gsheets_error(exc)}"
+            ) from exc
 
     def append_row(self, sheet: str, row: dict) -> None:
-        ws = self.book.worksheet(sheet)
+        ws = self.worksheet_or_create(sheet)
         df = pd.DataFrame([row])
         df = normalize_for_sheet(ensure_columns(df, sheet))
         values = df.iloc[0].tolist()
-        # table_range="A1" evita que Google detecte otra tabla o agregue la fila fuera del área visible.
-        response = ws.append_row(
-            values,
-            value_input_option="USER_ENTERED",
-            insert_data_option="INSERT_ROWS",
-            table_range="A1",
-            include_values_in_response=True,
-        )
-        return response
+        try:
+            response = ws.append_row(
+                values,
+                value_input_option="USER_ENTERED",
+                insert_data_option="INSERT_ROWS",
+                table_range="A1",
+                include_values_in_response=True,
+            )
+            return response
+        except Exception as exc:
+            raise RuntimeError(
+                f"No se pudo agregar fila en '{sheet}'. Detalle API: {exception_detail(exc)}. "
+                f"Revisión: {diagnose_gsheets_error(exc)}"
+            ) from exc
 
     def test_write(self) -> dict:
-        ws = self.book.worksheet("Config")
+        ws = self.worksheet_or_create("Config")
         stamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-        response = ws.append_row(
-            ["ultima_prueba_escritura", stamp],
-            value_input_option="USER_ENTERED",
-            insert_data_option="INSERT_ROWS",
-            table_range="A1",
-            include_values_in_response=True,
-        )
+        try:
+            response = ws.append_row(
+                ["ultima_prueba_escritura", stamp],
+                value_input_option="USER_ENTERED",
+                insert_data_option="INSERT_ROWS",
+                table_range="A1",
+                include_values_in_response=True,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"No se pudo ejecutar prueba de escritura. Detalle API: {exception_detail(exc)}. "
+                f"Revisión: {diagnose_gsheets_error(exc)}"
+            ) from exc
         return {"timestamp": stamp, "response": response}
 
     def info(self) -> dict:
@@ -1945,7 +2024,16 @@ def page_admin(storage, data: Dict[str, pd.DataFrame], mode: str) -> None:
 def main() -> None:
     apply_theme()
     storage, mode = get_storage()
-    data = load_all(storage)
+    try:
+        data = load_all(storage)
+    except Exception as exc:
+        st.error(
+            "La conexión se creó, pero falló al leer la estructura de la base. "
+            "El sistema se detuvo para evitar guardar datos en un lugar incorrecto."
+        )
+        st.code(exception_detail(exc))
+        st.info(diagnose_gsheets_error(exc))
+        st.stop()
 
     if not render_login(storage, data, mode):
         return
