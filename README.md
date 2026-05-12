@@ -180,3 +180,43 @@ Cambios principales:
 - El sistema sugiere el siguiente paso: completar catálogos, administrar usuarios, registrar ingresos o revisar reportes.
 - Se mantienen las mejoras del formulario de movimientos: primero producto/marca/lote y autocompletado desde catálogo.
 - Se conserva la vista de Kardex consolidado y el reporte exportable en Excel.
+
+
+### Nota sobre Google Sheets
+
+En `GOOGLE_SHEET_ID` puede pegar el ID puro o la URL completa de la hoja. El sistema extrae automáticamente el ID para evitar el error `APIError: [400]: Request contains an invalid argument`.
+
+## Corrección V9: guardado obligatorio en Google Sheets
+
+Esta versión evita una confusión importante: si `USE_GOOGLE_SHEETS = true` y la conexión falla, el sistema se detiene en vez de guardar silenciosamente en Excel local. Así se evita hacer pruebas pensando que se guardan en Google Sheets cuando realmente se estaban guardando en un archivo temporal local.
+
+También se agregó en **Administración → Diagnóstico** el botón **Probar escritura en Google Sheets**, que agrega una fila de prueba en la pestaña `Config`.
+
+### Secrets mínimos en Streamlit Cloud
+
+```toml
+USE_GOOGLE_SHEETS = true
+ALLOW_LOCAL_FALLBACK = false
+GOOGLE_SHEET_ID = "PEGUE_AQUI_EL_ID_O_URL_COMPLETA_DE_SU_HOJA_GOOGLE"
+
+[gcp_service_account]
+type = "service_account"
+project_id = "TU_PROJECT_ID"
+private_key_id = "TU_PRIVATE_KEY_ID"
+private_key = "-----BEGIN PRIVATE KEY-----\nTU_PRIVATE_KEY\n-----END PRIVATE KEY-----\n"
+client_email = "kardex-app@tu-proyecto.iam.gserviceaccount.com"
+client_id = "TU_CLIENT_ID"
+auth_uri = "https://accounts.google.com/o/oauth2/auth"
+token_uri = "https://oauth2.googleapis.com/token"
+auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+client_x509_cert_url = "TU_CLIENT_X509_CERT_URL"
+universe_domain = "googleapis.com"
+```
+
+### Checklist si no guarda
+
+1. La aplicación debe mostrar **Base activa: Google Sheets**.
+2. El Google Sheet debe estar compartido como **Editor** con el `client_email` de la cuenta de servicio.
+3. En Google Cloud deben estar habilitadas **Google Sheets API** y **Google Drive API**.
+4. La hoja debe ser un Google Sheet real, no un Excel `.xlsx` solo subido a Drive.
+5. En **Administración → Diagnóstico**, presione **Probar escritura en Google Sheets** y revise si aparece una fila en la pestaña `Config`.

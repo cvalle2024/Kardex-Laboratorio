@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import secrets
 import string
 import uuid
@@ -200,7 +201,7 @@ INITIAL_DATA: Dict[str, pd.DataFrame] = {
         {"clave": "institucion", "valor": "Proyecto VIHCA"},
         {"clave": "path_verificacion", "valor": "DINAMICO"},
         {"clave": "path_ttl_minutos", "valor": str(PATH_TTL_MINUTES)},
-        {"clave": "version_sistema", "valor": "7.0"},
+        {"clave": "version_sistema", "valor": "9.0"},
     ], columns=SHEET_COLUMNS["Config"]),
 }
 
@@ -292,6 +293,62 @@ def as_bool(value, default: bool = False) -> bool:
     return default
 
 
+def extract_google_sheet_id(value: str) -> str:
+    """Acepta un ID puro o una URL completa de Google Sheets y devuelve solo el ID.
+
+    Esto evita el error frecuente de Google Sheets API:
+    APIError [400]: Request contains an invalid argument, que aparece cuando
+    open_by_key recibe la URL completa en lugar del spreadsheetId.
+    """
+    text = clean_str(value)
+    if not text:
+        return ""
+
+    # Formato URL: https://docs.google.com/spreadsheets/d/<ID>/edit#gid=0
+    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", text)
+    if match:
+        return match.group(1)
+
+    # Formato compartido u otros enlaces que traen parámetros.
+    text = text.split("?")[0].split("#")[0].strip()
+    text = text.strip("/")
+    return text
+
+
+def normalize_service_account_info(creds_info) -> dict:
+    """Normaliza credenciales pegadas en Streamlit Secrets.
+
+    Corrige casos comunes:
+    - private_key con saltos de línea escapados como \n
+    - valores tipo AttrDict de Streamlit
+    """
+    info = dict(creds_info)
+    private_key = clean_str(info.get("private_key", ""))
+    if "\\n" in private_key:
+        private_key = private_key.replace("\\n", "\n")
+    info["private_key"] = private_key
+    return info
+
+
+def diagnose_gsheets_error(exc: Exception) -> str:
+    msg = str(exc)
+    low = msg.lower()
+    tips = []
+    if "invalid argument" in low or "[400]" in low:
+        tips.append("Verifique que GOOGLE_SHEET_ID sea el ID real de la hoja o una URL válida de Google Sheets. Esta versión ya extrae el ID si pega la URL completa.")
+        tips.append("Confirme que la hoja exista y no sea un archivo Excel subido a Drive sin convertir a Google Sheets.")
+        tips.append("Revise que los secretos TOML no tengan comillas faltantes, especialmente en private_key.")
+    if "permission" in low or "forbidden" in low or "403" in low:
+        tips.append("Comparta el Google Sheet con el client_email de la cuenta de servicio y permiso Editor.")
+    if "not found" in low or "404" in low:
+        tips.append("Revise que el ID/URL de la hoja sea correcto y que la cuenta de servicio tenga acceso.")
+    if "private key" in low or "could not deserialize" in low:
+        tips.append("Revise el campo private_key; debe conservar BEGIN PRIVATE KEY, END PRIVATE KEY y los saltos de línea \n.")
+    if not tips:
+        tips.append("Revise GOOGLE_SHEET_ID, gcp_service_account y que Google Sheets API esté habilitada en Google Cloud.")
+    return " ".join(tips)
+
+
 def normalize_for_sheet(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     for col in df.columns:
@@ -366,13 +423,28 @@ class GoogleSheetsStorage:
         except ImportError as exc:
             raise RuntimeError("Falta instalar gspread y google-auth para usar Google Sheets.") from exc
 
-        sheet_id = safe_secret("GOOGLE_SHEET_ID", "")
+        sheet_id_raw = safe_secret("GOOGLE_SHEET_ID", "")
+        sheet_id = extract_google_sheet_id(sheet_id_raw)
         creds_info = safe_secret("gcp_service_account", None)
         if not sheet_id or not creds_info:
             raise RuntimeError("No se encontró GOOGLE_SHEET_ID o gcp_service_account en los secretos de Streamlit.")
 
-        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-        credentials = Credentials.from_service_account_info(dict(creds_info), scopes=scopes)
+        creds_dict = normalize_service_account_info(creds_info)
+        client_email = clean_str(creds_dict.get("client_email", ""))
+        private_key = clean_str(creds_dict.get("private_key", ""))
+        if not client_email or "@" not in client_email:
+            raise RuntimeError("El campo client_email de gcp_service_account está vacío o no parece un correo válido.")
+        if "BEGIN PRIVATE KEY" not in private_key:
+            raise RuntimeError("El campo private_key no tiene el formato correcto. Debe iniciar con -----BEGIN PRIVATE KEY-----.")
+
+        self.sheet_id = sheet_id
+        self.client_email = client_email
+
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         client = gspread.authorize(credentials)
         self.book = client.open_by_key(sheet_id)
         self.ensure_database()
@@ -382,15 +454,25 @@ class GoogleSheetsStorage:
         for sheet, columns in SHEET_COLUMNS.items():
             if sheet not in existing:
                 ws = self.book.add_worksheet(title=sheet, rows=1000, cols=max(len(columns), 10))
-                ws.update([columns])
+                ws.update(values=[columns], range_name="A1", value_input_option="USER_ENTERED")
                 if not INITIAL_DATA[sheet].empty:
                     data = normalize_for_sheet(INITIAL_DATA[sheet])
-                    ws.append_rows(data.values.tolist(), value_input_option="USER_ENTERED")
+                    ws.append_rows(
+                        data.values.tolist(),
+                        value_input_option="USER_ENTERED",
+                        insert_data_option="INSERT_ROWS",
+                        table_range="A1",
+                    )
             else:
                 ws = self.book.worksheet(sheet)
                 values = ws.get_all_values()
                 if not values:
-                    ws.update([columns])
+                    ws.update(values=[columns], range_name="A1", value_input_option="USER_ENTERED")
+                else:
+                    # Si la primera fila no contiene los encabezados esperados, se corrige sin borrar datos.
+                    current_header = values[0]
+                    if current_header[:len(columns)] != columns:
+                        ws.update(values=[columns], range_name="A1", value_input_option="USER_ENTERED")
 
     def load(self, sheet: str) -> pd.DataFrame:
         ws = self.book.worksheet(sheet)
@@ -403,22 +485,58 @@ class GoogleSheetsStorage:
         df = normalize_for_sheet(ensure_columns(df, sheet))
         ws.clear()
         values = [SHEET_COLUMNS[sheet]] + df.values.tolist()
-        ws.update(values, value_input_option="USER_ENTERED")
+        ws.update(values=values, range_name="A1", value_input_option="USER_ENTERED")
 
     def append_row(self, sheet: str, row: dict) -> None:
         ws = self.book.worksheet(sheet)
         df = pd.DataFrame([row])
         df = normalize_for_sheet(ensure_columns(df, sheet))
-        ws.append_row(df.iloc[0].tolist(), value_input_option="USER_ENTERED")
+        values = df.iloc[0].tolist()
+        # table_range="A1" evita que Google detecte otra tabla o agregue la fila fuera del área visible.
+        response = ws.append_row(
+            values,
+            value_input_option="USER_ENTERED",
+            insert_data_option="INSERT_ROWS",
+            table_range="A1",
+            include_values_in_response=True,
+        )
+        return response
+
+    def test_write(self) -> dict:
+        ws = self.book.worksheet("Config")
+        stamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+        response = ws.append_row(
+            ["ultima_prueba_escritura", stamp],
+            value_input_option="USER_ENTERED",
+            insert_data_option="INSERT_ROWS",
+            table_range="A1",
+            include_values_in_response=True,
+        )
+        return {"timestamp": stamp, "response": response}
+
+    def info(self) -> dict:
+        return {"sheet_id": getattr(self, "sheet_id", ""), "client_email": getattr(self, "client_email", "")}
 
 
 def get_storage():
     use_gsheets = as_bool(safe_secret("USE_GOOGLE_SHEETS", False), False)
+    allow_local_fallback = as_bool(safe_secret("ALLOW_LOCAL_FALLBACK", False), False)
     if use_gsheets:
         try:
             return GoogleSheetsStorage(), "Google Sheets"
         except Exception as exc:
-            st.error(f"No se pudo conectar a Google Sheets. Se usará Excel local. Detalle: {exc}")
+            st.error(
+                "No se pudo conectar a Google Sheets. Para evitar que los registros se guarden solo en Excel local, "
+                "el sistema se detuvo. "
+                f"Detalle técnico: {exc}. "
+                f"Revisión sugerida: {diagnose_gsheets_error(exc)}"
+            )
+            st.info(
+                "Si desea permitir respaldo temporal en Excel local, agregue en Secrets: ALLOW_LOCAL_FALLBACK = true. "
+                "Para producción, manténgalo en false."
+            )
+            if not allow_local_fallback:
+                st.stop()
     return LocalExcelStorage(DB_FILE), "Excel local"
 
 # ============================================================
@@ -807,7 +925,7 @@ def hero(storage_mode: str, user_name: str = "") -> None:
         <div class="hero">
             <h1>📦 {APP_TITLE}</h1>
             <p>{APP_SUBTITLE}</p>
-            <div style="margin-top:12px"><span class='pill'>Base activa: {storage_mode}</span>{user_badge}<span class='pill'>Versión 6.0</span></div>
+            <div style="margin-top:12px"><span class='pill'>Base activa: {storage_mode}</span>{user_badge}<span class='pill'>Versión 9.0</span></div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1806,9 +1924,20 @@ def page_admin(storage, data: Dict[str, pd.DataFrame], mode: str) -> None:
                 status_rows.append({"Hoja": sheet, "Estado": f"Error: {exc}", "Filas": 0, "Columnas esperadas": len(SHEET_COLUMNS[sheet])})
         st.dataframe(pd.DataFrame(status_rows), use_container_width=True, hide_index=True)
         if mode == "Excel local":
-            st.info(f"Ruta de base local: {DB_FILE.resolve()}")
+            st.warning(f"Base activa: Excel local. Ruta: {DB_FILE.resolve()}. Si está en Streamlit Cloud, estos datos no se verán en Google Sheets.")
         else:
-            st.info("Base conectada a Google Sheets mediante secretos de Streamlit.")
+            info = storage.info() if hasattr(storage, "info") else {}
+            st.success("Base activa: Google Sheets. Los registros deben guardarse en las pestañas del archivo conectado.")
+            st.caption(f"Google Sheet ID: {info.get('sheet_id', '')}")
+            st.caption(f"Cuenta de servicio: {info.get('client_email', '')}")
+            if st.button("🧪 Probar escritura en Google Sheets", use_container_width=True):
+                try:
+                    result = storage.test_write()
+                    st.success(f"Prueba guardada correctamente en la pestaña Config: {result['timestamp']}")
+                    st.json(result.get("response", {}))
+                except Exception as exc:
+                    st.error(f"No se pudo escribir en Google Sheets: {exc}")
+                    st.info(diagnose_gsheets_error(exc))
 
 # ============================================================
 # APP PRINCIPAL

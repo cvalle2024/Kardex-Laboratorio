@@ -78,7 +78,7 @@ Pegue este bloque, reemplazando los datos por los del JSON de Google Cloud:
 
 ```toml
 USE_GOOGLE_SHEETS = true
-GOOGLE_SHEET_ID = "PEGUE_AQUI_EL_ID_DE_SU_HOJA_GOOGLE"
+GOOGLE_SHEET_ID = "PEGUE_AQUI_EL_ID_O_URL_COMPLETA_DE_SU_HOJA_GOOGLE"
 
 [gcp_service_account]
 type = "service_account"
@@ -138,3 +138,40 @@ En el login, el sistema genera un PATH temporal. Copie el código generado y pé
 - No suba `.streamlit/secrets.toml`.
 - Cambie la contraseña del usuario `admin` después del primer ingreso.
 - En Google Sheets, comparta la hoja solo con la cuenta de servicio y personas autorizadas.
+
+
+## Corrección de error 400: Request contains an invalid argument
+
+Esta versión acepta en `GOOGLE_SHEET_ID` tanto el ID puro como la URL completa del Google Sheet.
+
+Ejemplo válido con ID:
+
+```toml
+GOOGLE_SHEET_ID = "1AbCDefGhIjK123456789"
+```
+
+Ejemplo válido con URL completa:
+
+```toml
+GOOGLE_SHEET_ID = "https://docs.google.com/spreadsheets/d/1AbCDefGhIjK123456789/edit#gid=0"
+```
+
+Si el error persiste, revise:
+
+1. Que el archivo sea realmente un Google Sheet, no un Excel cargado en Drive sin convertir.
+2. Que la hoja esté compartida con el `client_email` de la cuenta de servicio como Editor.
+3. Que `private_key` conserve `-----BEGIN PRIVATE KEY-----`, `-----END PRIVATE KEY-----` y los saltos de línea `\n`.
+4. Que Google Sheets API esté habilitada en el proyecto de Google Cloud.
+
+## Importante V9: evitar guardado local accidental
+
+En versiones anteriores, si Google Sheets fallaba, el sistema podía usar Excel local como respaldo. En Streamlit Cloud eso puede confundir, porque el usuario registra datos pero no aparecen en Google Sheets.
+
+En V9, use:
+
+```toml
+USE_GOOGLE_SHEETS = true
+ALLOW_LOCAL_FALLBACK = false
+```
+
+Con esta configuración, si Google Sheets falla, el sistema se detiene y muestra el error real.
