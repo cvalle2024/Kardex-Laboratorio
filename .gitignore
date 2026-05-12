@@ -1,0 +1,19 @@
+# Credenciales y secretos locales
+.streamlit/secrets.toml
+*.json
+.env
+
+# Base local generada automáticamente
+data/kardex_db.xlsx
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Sistema operativo / editores
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
