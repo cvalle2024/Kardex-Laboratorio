@@ -4,10 +4,13 @@ import hashlib
 import re
 import secrets
 import string
+import time
 import uuid
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Tuple
+from urllib.parse import quote
+
 
 import numpy as np
 import pandas as pd
@@ -201,7 +204,7 @@ INITIAL_DATA: Dict[str, pd.DataFrame] = {
         {"clave": "institucion", "valor": "Proyecto VIHCA"},
         {"clave": "path_verificacion", "valor": "DINAMICO"},
         {"clave": "path_ttl_minutos", "valor": str(PATH_TTL_MINUTES)},
-        {"clave": "version_sistema", "valor": "9.0"},
+        {"clave": "version_sistema", "valor": "12.0"},
     ], columns=SHEET_COLUMNS["Config"]),
 }
 
@@ -339,6 +342,44 @@ def extract_google_sheet_id(value: str) -> str:
     return text
 
 
+def column_letter(n: int) -> str:
+    """Convierte 1 -> A, 27 -> AA para rangos de Google Sheets."""
+    result = ""
+    n = max(int(n), 1)
+    while n:
+        n, rem = divmod(n - 1, 26)
+        result = chr(65 + rem) + result
+    return result
+
+
+def sheet_range_for(sheet: str) -> str:
+    last_col = column_letter(len(SHEET_COLUMNS[sheet]))
+    # Se usa rango de columnas completas para que Google devuelva solo las filas con datos.
+    return f"'{sheet}'!A:{last_col}"
+
+
+def values_to_dataframe(values: list, sheet: str) -> pd.DataFrame:
+    """Convierte el resultado crudo de values_batch_get en DataFrame con columnas esperadas."""
+    columns = SHEET_COLUMNS[sheet]
+    if not values:
+        return pd.DataFrame(columns=columns)
+    rows = values[1:] if len(values) > 1 else []
+    normalized_rows = [(list(row) + [""] * len(columns))[:len(columns)] for row in rows]
+    return ensure_columns(pd.DataFrame(normalized_rows, columns=columns), sheet)
+
+
+def mark_data_dirty() -> None:
+    """Invalida caché de datos después de guardar para refrescar Google Sheets sin exceso de lecturas."""
+    try:
+        st.session_state["data_refresh_token"] = st.session_state.get("data_refresh_token", 0) + 1
+    except Exception:
+        pass
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+
+
 def normalize_service_account_info(creds_info) -> dict:
     """Normaliza credenciales pegadas en Streamlit Secrets.
 
@@ -432,24 +473,31 @@ class LocalExcelStorage:
         df = ensure_columns(df, sheet)
         with pd.ExcelWriter(self.path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
             df.to_excel(writer, index=False, sheet_name=sheet)
+        mark_data_dirty()
 
     def append_row(self, sheet: str, row: dict) -> None:
         df = self.load(sheet)
         df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
         self.save(sheet, df)
+        mark_data_dirty()
 
 
 class GoogleSheetsStorage:
+    """Almacenamiento Google Sheets optimizado por API REST directa.
+
+    Mejoras V12:
+    - Ya no usa open_by_key() ni worksheet(), porque esas llamadas hacen lecturas de metadata.
+    - Lee todas las pestañas con values:batchGet en una sola petición.
+    - Guarda con endpoints de values update/append.
+    - Incluye reintentos con espera si Google devuelve 429 por cuota.
+    """
     def __init__(self):
         try:
-            import gspread
             from google.oauth2.service_account import Credentials
+            from google.auth.transport.requests import AuthorizedSession
         except ImportError as exc:
-            raise RuntimeError("Falta instalar gspread y google-auth para usar Google Sheets.") from exc
-        self.gspread = gspread
+            raise RuntimeError("Falta instalar google-auth para usar Google Sheets.") from exc
 
-        # Soporta la estructura oficial de esta app y, como respaldo, los nombres que
-        # algunas guías usan: [google_service_account] y [google_sheets].
         sheet_id_raw = safe_secret("GOOGLE_SHEET_ID", "") or nested_secret("google_sheets", "spreadsheet_id", "")
         sheet_id = extract_google_sheet_id(sheet_id_raw)
         creds_info = safe_secret("gcp_service_account", None) or safe_secret("google_service_account", None)
@@ -464,91 +512,146 @@ class GoogleSheetsStorage:
         private_key = clean_str(creds_dict.get("private_key", ""))
         if not client_email or "@" not in client_email:
             raise RuntimeError("El campo client_email de gcp_service_account está vacío o no parece un correo válido.")
-        if "BEGIN PRIVATE KEY" not in private_key:
-            raise RuntimeError("El campo private_key no tiene el formato correcto. Debe iniciar con -----BEGIN PRIVATE KEY-----.")
+        if "BEGIN PRIVATE KEY" not in private_key or "END PRIVATE KEY" not in private_key:
+            raise RuntimeError("El campo private_key no tiene el formato correcto. Debe incluir BEGIN PRIVATE KEY y END PRIVATE KEY.")
 
         self.sheet_id = sheet_id
         self.client_email = client_email
-
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive",
         ]
-        credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        client = gspread.authorize(credentials)
         try:
-            self.book = client.open_by_key(sheet_id)
-            # Forzar lectura de metadata aquí para detectar permisos/ID antes de cargar datos.
-            _ = self.book.worksheets()
+            credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         except Exception as exc:
             raise RuntimeError(
-                "No se pudo abrir el Google Sheet indicado. "
-                f"Detalle API: {exception_detail(exc)}. "
-                f"Revisión: {diagnose_gsheets_error(exc)}"
+                "No se pudieron cargar las credenciales de la cuenta de servicio. "
+                f"Detalle: {exception_detail(exc)}"
             ) from exc
-        self.ensure_database()
+        self.session = AuthorizedSession(credentials)
+        self.base_url = f"https://sheets.googleapis.com/v4/spreadsheets/{self.sheet_id}"
 
-    def ensure_database(self) -> None:
-        existing = [ws.title for ws in self.book.worksheets()]
-        for sheet, columns in SHEET_COLUMNS.items():
-            if sheet not in existing:
-                ws = self.book.add_worksheet(title=sheet, rows=1000, cols=max(len(columns), 10))
-                ws.update(values=[columns], range_name="A1", value_input_option="USER_ENTERED")
-                if not INITIAL_DATA[sheet].empty:
-                    data = normalize_for_sheet(INITIAL_DATA[sheet])
-                    ws.append_rows(
-                        data.values.tolist(),
-                        value_input_option="USER_ENTERED",
-                        insert_data_option="INSERT_ROWS",
-                        table_range="A1",
-                    )
-            else:
-                ws = self.book.worksheet(sheet)
-                values = ws.get_all_values()
-                if not values:
-                    ws.update(values=[columns], range_name="A1", value_input_option="USER_ENTERED")
-                else:
-                    # Si la primera fila no contiene los encabezados esperados, se corrige sin borrar datos.
-                    current_header = values[0]
-                    if current_header[:len(columns)] != columns:
-                        ws.update(values=[columns], range_name="A1", value_input_option="USER_ENTERED")
+        # Prepara pestañas con operaciones de escritura. Esto evita la llamada de metadata
+        # que estaba disparando el error 429 en open_by_key()/fetch_sheet_metadata.
+        auto_create = as_bool(safe_secret("AUTO_CREATE_SHEETS", True), True)
+        if auto_create:
+            self.ensure_database_write_only()
 
-    def worksheet_or_create(self, sheet: str):
+    def _request(self, method: str, url: str, *, ok_empty: bool = False, **kwargs):
+        """Ejecuta una llamada REST con reintentos para 429/5xx."""
+        max_attempts = int(safe_secret("GSHEETS_MAX_RETRIES", 3) or 3)
+        base_wait = int(safe_secret("GSHEETS_RETRY_SECONDS", 20) or 20)
+        last_detail = ""
+        for attempt in range(max_attempts + 1):
+            try:
+                response = self.session.request(method, url, timeout=40, **kwargs)
+            except Exception as exc:
+                last_detail = exception_detail(exc)
+                if attempt >= max_attempts:
+                    raise RuntimeError(f"No se pudo contactar Google Sheets. Detalle: {last_detail}") from exc
+                time.sleep(min(base_wait * (attempt + 1), 60))
+                continue
+
+            if response.status_code in (429, 500, 502, 503, 504):
+                last_detail = response.text[:1000]
+                if attempt < max_attempts:
+                    wait = min(base_wait * (attempt + 1), 60)
+                    try:
+                        st.warning(f"Google Sheets está limitando solicitudes temporalmente ({response.status_code}). Reintentando en {wait} segundos...")
+                    except Exception:
+                        pass
+                    time.sleep(wait)
+                    continue
+
+            if not response.ok:
+                detail = response.text[:1600]
+                raise RuntimeError(f"APIError: [{response.status_code}]: {detail}")
+
+            if ok_empty or not response.text:
+                return {}
+            try:
+                return response.json()
+            except Exception:
+                return {}
+
+        raise RuntimeError(
+            "Google Sheets sigue devolviendo error de cuota o disponibilidad después de varios reintentos. "
+            f"Último detalle: {last_detail}"
+        )
+
+    def _values_url(self, sheet: str, suffix: str = "") -> str:
+        rng = quote(sheet_range_for(sheet), safe="")
+        return f"{self.base_url}/values/{rng}{suffix}"
+
+    def ensure_database_write_only(self) -> None:
+        """Crea pestañas faltantes y escribe encabezados sin leer metadata.
+
+        Si la pestaña ya existe, Google devuelve 400 y se ignora para continuar.
+        Luego se escriben encabezados en A1 de cada pestaña existente.
+        """
+        for sheet in SHEET_COLUMNS.keys():
+            # Intentar crear la pestaña. Si ya existe, no pasa nada.
+            body = {"requests": [{"addSheet": {"properties": {"title": sheet, "gridProperties": {"rowCount": 1000, "columnCount": max(len(SHEET_COLUMNS[sheet]), 10)}}}}]}
+            try:
+                self._request("post", f"{self.base_url}:batchUpdate", json=body, ok_empty=True)
+            except Exception as exc:
+                msg = str(exc).lower()
+                # Errores esperados si la pestaña ya existe. Se ignoran.
+                if "already exists" not in msg and "already exist" not in msg and "duplicate" not in msg:
+                    # Si el error es cuota, sí lo reportamos.
+                    if "429" in msg or "quota" in msg or "resource_exhausted" in msg:
+                        raise RuntimeError(
+                            "No se pudo crear/verificar estructura por cuota de Google Sheets. "
+                            f"Detalle: {exception_detail(exc)}"
+                        ) from exc
+
+            # Escribir encabezados. Es una operación de escritura y no consume cuota de lectura.
+            header_range = quote(f"'{sheet}'!A1:{column_letter(len(SHEET_COLUMNS[sheet]))}1", safe="")
+            url = f"{self.base_url}/values/{header_range}?valueInputOption=USER_ENTERED"
+            try:
+                self._request("put", url, json={"values": [SHEET_COLUMNS[sheet]]}, ok_empty=True)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"No se pudo escribir encabezados en la pestaña '{sheet}'. "
+                    f"Detalle API: {exception_detail(exc)}. Revisión: {diagnose_gsheets_error(exc)}"
+                ) from exc
+
+    def load_many(self, sheets: list[str]) -> Dict[str, pd.DataFrame]:
+        """Carga varias pestañas con una sola lectura real a la API."""
+        ranges = [sheet_range_for(sheet) for sheet in sheets]
+        params = []
+        for rng in ranges:
+            params.append(("ranges", rng))
+        params.append(("majorDimension", "ROWS"))
         try:
-            return self.book.worksheet(sheet)
+            result = self._request("get", f"{self.base_url}/values:batchGet", params=params)
         except Exception as exc:
-            # Si la conexión existe pero falta una pestaña, intentamos crearla.
-            # Si el error es de permisos/ID/API, se muestra un diagnóstico claro.
-            detail = exception_detail(exc)
-            low = detail.lower()
-            if "not found" in low or "worksheetnotfound" in low:
-                ws = self.book.add_worksheet(title=sheet, rows=1000, cols=max(len(SHEET_COLUMNS[sheet]), 10))
-                ws.update(values=[SHEET_COLUMNS[sheet]], range_name="A1", value_input_option="USER_ENTERED")
-                return ws
             raise RuntimeError(
-                f"No se pudo acceder a la pestaña '{sheet}' del Google Sheet. "
-                f"Detalle API: {detail}. Revisión: {diagnose_gsheets_error(exc)}"
+                "No se pudo leer Google Sheets por lote. "
+                f"Detalle API: {exception_detail(exc)}. Revisión: {diagnose_gsheets_error(exc)}"
             ) from exc
+
+        value_ranges = result.get("valueRanges", []) if isinstance(result, dict) else []
+        out = {}
+        for idx, sheet in enumerate(sheets):
+            values = []
+            if idx < len(value_ranges):
+                values = value_ranges[idx].get("values", [])
+            out[sheet] = values_to_dataframe(values, sheet)
+        return out
 
     def load(self, sheet: str) -> pd.DataFrame:
-        ws = self.worksheet_or_create(sheet)
-        try:
-            records = ws.get_all_records()
-        except Exception as exc:
-            raise RuntimeError(
-                f"No se pudo leer la pestaña '{sheet}'. Detalle API: {exception_detail(exc)}. "
-                f"Revisión: {diagnose_gsheets_error(exc)}"
-            ) from exc
-        df = pd.DataFrame(records)
-        return ensure_columns(df, sheet)
+        return self.load_many([sheet]).get(sheet, pd.DataFrame(columns=SHEET_COLUMNS[sheet]))
 
     def save(self, sheet: str, df: pd.DataFrame) -> None:
-        ws = self.worksheet_or_create(sheet)
         df = normalize_for_sheet(ensure_columns(df, sheet))
         try:
-            ws.clear()
+            clear_url = self._values_url(sheet, ":clear")
+            self._request("post", clear_url, json={}, ok_empty=True)
             values = [SHEET_COLUMNS[sheet]] + df.values.tolist()
-            ws.update(values=values, range_name="A1", value_input_option="USER_ENTERED")
+            update_url = f"{self._values_url(sheet)}?valueInputOption=USER_ENTERED"
+            self._request("put", update_url, json={"values": values}, ok_empty=True)
+            mark_data_dirty()
         except Exception as exc:
             raise RuntimeError(
                 f"No se pudo guardar la pestaña '{sheet}'. Detalle API: {exception_detail(exc)}. "
@@ -556,18 +659,14 @@ class GoogleSheetsStorage:
             ) from exc
 
     def append_row(self, sheet: str, row: dict) -> None:
-        ws = self.worksheet_or_create(sheet)
         df = pd.DataFrame([row])
         df = normalize_for_sheet(ensure_columns(df, sheet))
         values = df.iloc[0].tolist()
+        append_range = quote(f"'{sheet}'!A1", safe="")
+        url = f"{self.base_url}/values/{append_range}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS&includeValuesInResponse=false"
         try:
-            response = ws.append_row(
-                values,
-                value_input_option="USER_ENTERED",
-                insert_data_option="INSERT_ROWS",
-                table_range="A1",
-                include_values_in_response=True,
-            )
+            response = self._request("post", url, json={"values": [values]})
+            mark_data_dirty()
             return response
         except Exception as exc:
             raise RuntimeError(
@@ -576,16 +675,9 @@ class GoogleSheetsStorage:
             ) from exc
 
     def test_write(self) -> dict:
-        ws = self.worksheet_or_create("Config")
         stamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
         try:
-            response = ws.append_row(
-                ["ultima_prueba_escritura", stamp],
-                value_input_option="USER_ENTERED",
-                insert_data_option="INSERT_ROWS",
-                table_range="A1",
-                include_values_in_response=True,
-            )
+            response = self.append_row("Config", {"clave": "ultima_prueba_escritura", "valor": stamp})
         except Exception as exc:
             raise RuntimeError(
                 f"No se pudo ejecutar prueba de escritura. Detalle API: {exception_detail(exc)}. "
@@ -596,13 +688,17 @@ class GoogleSheetsStorage:
     def info(self) -> dict:
         return {"sheet_id": getattr(self, "sheet_id", ""), "client_email": getattr(self, "client_email", "")}
 
+@st.cache_resource(show_spinner=False)
+def get_google_storage_cached():
+    return GoogleSheetsStorage()
+
 
 def get_storage():
     use_gsheets = as_bool(safe_secret("USE_GOOGLE_SHEETS", False), False)
     allow_local_fallback = as_bool(safe_secret("ALLOW_LOCAL_FALLBACK", False), False)
     if use_gsheets:
         try:
-            return GoogleSheetsStorage(), "Google Sheets"
+            return get_google_storage_cached(), "Google Sheets"
         except Exception as exc:
             st.error(
                 "No se pudo conectar a Google Sheets. Para evitar que los registros se guarden solo en Excel local, "
@@ -621,7 +717,22 @@ def get_storage():
 # ============================================================
 # CÁLCULOS DE KARDEX
 # ============================================================
-def load_all(storage) -> Dict[str, pd.DataFrame]:
+@st.cache_data(ttl=60, show_spinner="Cargando base desde Google Sheets...")
+def load_all_cached(_storage, mode: str, refresh_token: int) -> Dict[str, pd.DataFrame]:
+    """Carga la base usando caché para evitar exceder cuota de Google Sheets.
+
+    refresh_token cambia después de cada guardado; ttl evita releer en cada rerun.
+    """
+    sheets = list(SHEET_COLUMNS.keys())
+    if hasattr(_storage, "load_many"):
+        return _storage.load_many(sheets)
+    return {sheet: _storage.load(sheet) for sheet in sheets}
+
+
+def load_all(storage, mode: str = "") -> Dict[str, pd.DataFrame]:
+    if mode == "Google Sheets":
+        refresh_token = st.session_state.get("data_refresh_token", 0)
+        return load_all_cached(storage, mode, refresh_token)
     return {sheet: storage.load(sheet) for sheet in SHEET_COLUMNS.keys()}
 
 
@@ -1992,15 +2103,14 @@ def page_admin(storage, data: Dict[str, pd.DataFrame], mode: str) -> None:
         st.info("En la pantalla de login aparecerá el campo 'Código PATH generado'. El usuario debe copiar ese código y pegarlo en 'Pegar PATH generado'.")
 
     with tab3:
-        card_start("Diagnóstico de base y estructura", "Verifica que existan las hojas obligatorias y muestra el PATH de almacenamiento activo.")
+        card_start("Diagnóstico de base y estructura", "Verifica hojas cargadas, conexión activa y evita lecturas innecesarias a Google Sheets.")
+        if mode == "Google Sheets":
+            st.info("Modo optimizado V12: conexión por API REST directa, sin open_by_key/metadata, lectura por lotes y caché para reducir el error 429 de cuota.")
         expected = list(SHEET_COLUMNS.keys())
         status_rows = []
         for sheet in expected:
-            try:
-                df = storage.load(sheet)
-                status_rows.append({"Hoja": sheet, "Estado": "OK", "Filas": len(df), "Columnas esperadas": len(SHEET_COLUMNS[sheet])})
-            except Exception as exc:
-                status_rows.append({"Hoja": sheet, "Estado": f"Error: {exc}", "Filas": 0, "Columnas esperadas": len(SHEET_COLUMNS[sheet])})
+            df = ensure_columns(data.get(sheet, pd.DataFrame()), sheet)
+            status_rows.append({"Hoja": sheet, "Estado": "OK", "Filas cargadas": len(df), "Columnas esperadas": len(SHEET_COLUMNS[sheet])})
         st.dataframe(pd.DataFrame(status_rows), use_container_width=True, hide_index=True)
         if mode == "Excel local":
             st.warning(f"Base activa: Excel local. Ruta: {DB_FILE.resolve()}. Si está en Streamlit Cloud, estos datos no se verán en Google Sheets.")
@@ -2025,7 +2135,7 @@ def main() -> None:
     apply_theme()
     storage, mode = get_storage()
     try:
-        data = load_all(storage)
+        data = load_all(storage, mode)
     except Exception as exc:
         st.error(
             "La conexión se creó, pero falló al leer la estructura de la base. "

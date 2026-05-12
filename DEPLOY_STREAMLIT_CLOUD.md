@@ -175,3 +175,13 @@ ALLOW_LOCAL_FALLBACK = false
 ```
 
 Con esta configuración, si Google Sheets falla, el sistema se detiene y muestra el error real.
+
+
+## Si aparece APIError [429] Quota exceeded
+
+Google Sheets limita las lecturas por minuto. La V11 ya minimiza las lecturas; si el error aparece durante pruebas intensas:
+
+1. Espere 60 segundos.
+2. Evite presionar varias veces los botones de recarga/reboot.
+3. Verifique que esté usando esta V11 o superior.
+4. Mantenga `ALLOW_LOCAL_FALLBACK = false` en producción para no guardar datos fuera de Google Sheets.

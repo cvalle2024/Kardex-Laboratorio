@@ -220,3 +220,15 @@ universe_domain = "googleapis.com"
 3. En Google Cloud deben estar habilitadas **Google Sheets API** y **Google Drive API**.
 4. La hoja debe ser un Google Sheet real, no un Excel `.xlsx` solo subido a Drive.
 5. En **Administración → Diagnóstico**, presione **Probar escritura en Google Sheets** y revise si aparece una fila en la pestaña `Config`.
+
+
+## Mejora V11: control de cuota Google Sheets
+
+Esta versión reduce el error `APIError [429]: Quota exceeded` usando:
+
+- Lectura por lotes de todas las pestañas con una sola petición.
+- Caché de datos por 60 segundos para evitar recargar la base en cada interacción de Streamlit.
+- Reutilización de la conexión de Google Sheets con `st.cache_resource`.
+- Diagnóstico sin re-leer todas las pestañas desde Google Sheets.
+
+Si aparece un error 429, espere al menos 60 segundos y reinicie/recargue la app.
