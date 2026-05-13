@@ -68,6 +68,15 @@ SHEET_COLUMNS: Dict[str, List[str]] = {
     "Config": ["clave", "valor"],
 }
 
+# Hojas que se leen al iniciar el sistema.
+# Kardex_Consolidado es una hoja calculada/sincronizada desde Movimientos,
+# por eso NO debe ser requisito de lectura al arrancar. Si la pestaña no existe
+# todavía en Google Sheets, el sistema debe poder iniciar y crearla al sincronizar.
+CORE_SHEETS: List[str] = [
+    "Productos", "Proveedores", "Solicitantes", "Personal", "Usuarios", "Movimientos", "Config"
+]
+CALCULATED_SHEETS: List[str] = ["Kardex_Consolidado"]
+
 TIPOS_MOVIMIENTO = ["Ingreso", "Salida", "Devolución", "Ajuste entrada", "Ajuste salida"]
 TIPOS_POSITIVOS = {"Ingreso", "Devolución", "Ajuste entrada"}
 TIPOS_NEGATIVOS = {"Salida", "Ajuste salida"}
@@ -627,38 +636,63 @@ class GoogleSheetsStorage:
         rng = quote(sheet_range_for(sheet), safe="")
         return f"{self.base_url}/values/{rng}{suffix}"
 
+    def _create_sheet_and_header(self, sheet: str) -> None:
+        """Crea una pestaña y escribe encabezados sin depender de metadata.
+
+        Es segura para ejecutar varias veces: si la pestaña ya existe, se ignora
+        el error esperado de duplicado y se reescribe únicamente el encabezado.
+        """
+        if sheet not in SHEET_COLUMNS:
+            raise RuntimeError(f"La hoja '{sheet}' no está definida en SHEET_COLUMNS.")
+
+        body = {
+            "requests": [
+                {
+                    "addSheet": {
+                        "properties": {
+                            "title": sheet,
+                            "gridProperties": {
+                                "rowCount": 1000,
+                                "columnCount": max(len(SHEET_COLUMNS[sheet]), 10),
+                            },
+                        }
+                    }
+                }
+            ]
+        }
+        try:
+            self._request("post", f"{self.base_url}:batchUpdate", json=body, ok_empty=True)
+        except Exception as exc:
+            msg = str(exc).lower()
+            # Errores esperados si la pestaña ya existe. Se ignoran.
+            if "already exists" not in msg and "already exist" not in msg and "duplicate" not in msg:
+                if "429" in msg or "quota" in msg or "resource_exhausted" in msg:
+                    raise RuntimeError(
+                        "No se pudo crear/verificar estructura por cuota de Google Sheets. "
+                        f"Detalle: {exception_detail(exc)}"
+                    ) from exc
+                if "unable to parse range" not in msg:
+                    raise
+
+        header_range = quote(f"'{sheet}'!A1:{column_letter(len(SHEET_COLUMNS[sheet]))}1", safe="")
+        url = f"{self.base_url}/values/{header_range}?valueInputOption=USER_ENTERED"
+        try:
+            self._request("put", url, json={"values": [SHEET_COLUMNS[sheet]]}, ok_empty=True)
+        except Exception as exc:
+            raise RuntimeError(
+                f"No se pudo escribir encabezados en la pestaña '{sheet}'. "
+                f"Detalle API: {exception_detail(exc)}. Revisión: {diagnose_gsheets_error(exc)}"
+            ) from exc
+
     def ensure_database_write_only(self) -> None:
         """Crea pestañas faltantes y escribe encabezados sin leer metadata.
 
-        Si la pestaña ya existe, Google devuelve 400 y se ignora para continuar.
-        Luego se escriben encabezados en A1 de cada pestaña existente.
+        V15: la hoja Kardex_Consolidado se crea, pero ya no se lee al iniciar
+        porque es una hoja calculada. Esto evita detener el sistema si esa pestaña
+        física aún no existe o si Google Sheets limita lecturas de estructura.
         """
         for sheet in SHEET_COLUMNS.keys():
-            # Intentar crear la pestaña. Si ya existe, no pasa nada.
-            body = {"requests": [{"addSheet": {"properties": {"title": sheet, "gridProperties": {"rowCount": 1000, "columnCount": max(len(SHEET_COLUMNS[sheet]), 10)}}}}]}
-            try:
-                self._request("post", f"{self.base_url}:batchUpdate", json=body, ok_empty=True)
-            except Exception as exc:
-                msg = str(exc).lower()
-                # Errores esperados si la pestaña ya existe. Se ignoran.
-                if "already exists" not in msg and "already exist" not in msg and "duplicate" not in msg:
-                    # Si el error es cuota, sí lo reportamos.
-                    if "429" in msg or "quota" in msg or "resource_exhausted" in msg:
-                        raise RuntimeError(
-                            "No se pudo crear/verificar estructura por cuota de Google Sheets. "
-                            f"Detalle: {exception_detail(exc)}"
-                        ) from exc
-
-            # Escribir encabezados. Es una operación de escritura y no consume cuota de lectura.
-            header_range = quote(f"'{sheet}'!A1:{column_letter(len(SHEET_COLUMNS[sheet]))}1", safe="")
-            url = f"{self.base_url}/values/{header_range}?valueInputOption=USER_ENTERED"
-            try:
-                self._request("put", url, json={"values": [SHEET_COLUMNS[sheet]]}, ok_empty=True)
-            except Exception as exc:
-                raise RuntimeError(
-                    f"No se pudo escribir encabezados en la pestaña '{sheet}'. "
-                    f"Detalle API: {exception_detail(exc)}. Revisión: {diagnose_gsheets_error(exc)}"
-                ) from exc
+            self._create_sheet_and_header(sheet)
 
     def load_many(self, sheets: list[str]) -> Dict[str, pd.DataFrame]:
         """Carga varias pestañas con una sola lectura real a la API."""
@@ -690,6 +724,10 @@ class GoogleSheetsStorage:
     def save(self, sheet: str, df: pd.DataFrame) -> None:
         df = normalize_for_sheet(ensure_columns(df, sheet))
         try:
+            # Asegura que la pestaña exista antes de limpiar/actualizar. Esto es clave
+            # para Kardex_Consolidado, porque es una hoja calculada que puede no existir
+            # todavía en bases Google Sheets creadas con versiones anteriores.
+            self._create_sheet_and_header(sheet)
             clear_url = self._values_url(sheet, ":clear")
             self._request("post", clear_url, json={}, ok_empty=True)
             values = [SHEET_COLUMNS[sheet]] + df.values.tolist()
@@ -709,6 +747,7 @@ class GoogleSheetsStorage:
         append_range = quote(f"'{sheet}'!A1", safe="")
         url = f"{self.base_url}/values/{append_range}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS&includeValuesInResponse=false"
         try:
+            self._create_sheet_and_header(sheet)
             response = self._request("post", url, json={"values": [values]})
             mark_data_dirty()
             return response
@@ -767,17 +806,25 @@ def load_all_cached(_storage, mode: str, refresh_token: int) -> Dict[str, pd.Dat
 
     refresh_token cambia después de cada guardado; ttl evita releer en cada rerun.
     """
-    sheets = list(SHEET_COLUMNS.keys())
+    # Solo se leen las hojas transaccionales/base.
+    # Kardex_Consolidado se calcula desde Movimientos y Productos; no se lee como requisito
+    # para que la app no se detenga si la pestaña física aún no existe.
+    sheets = CORE_SHEETS
     if hasattr(_storage, "load_many"):
-        return _storage.load_many(sheets)
-    return {sheet: _storage.load(sheet) for sheet in sheets}
+        data = _storage.load_many(sheets)
+    else:
+        data = {sheet: _storage.load(sheet) for sheet in sheets}
+    data["Kardex_Consolidado"] = pd.DataFrame(columns=SHEET_COLUMNS["Kardex_Consolidado"])
+    return data
 
 
 def load_all(storage, mode: str = "") -> Dict[str, pd.DataFrame]:
     if mode == "Google Sheets":
         refresh_token = st.session_state.get("data_refresh_token", 0)
         return load_all_cached(storage, mode, refresh_token)
-    return {sheet: storage.load(sheet) for sheet in SHEET_COLUMNS.keys()}
+    data = {sheet: storage.load(sheet) for sheet in CORE_SHEETS}
+    data["Kardex_Consolidado"] = pd.DataFrame(columns=SHEET_COLUMNS["Kardex_Consolidado"])
+    return data
 
 
 def calcular_stock(df_mov: pd.DataFrame, df_prod: pd.DataFrame) -> pd.DataFrame:
@@ -2208,7 +2255,11 @@ def page_admin(storage, data: Dict[str, pd.DataFrame], mode: str) -> None:
         status_rows = []
         for sheet in expected:
             df = ensure_columns(data.get(sheet, pd.DataFrame()), sheet)
-            status_rows.append({"Hoja": sheet, "Estado": "OK", "Filas cargadas": len(df), "Columnas esperadas": len(SHEET_COLUMNS[sheet])})
+            if sheet == "Kardex_Consolidado":
+                estado_hoja = "Calculada desde Movimientos; se sincroniza a Google Sheets con el botón"
+            else:
+                estado_hoja = "OK"
+            status_rows.append({"Hoja": sheet, "Estado": estado_hoja, "Filas cargadas/calculadas": len(df), "Columnas esperadas": len(SHEET_COLUMNS[sheet])})
         st.dataframe(pd.DataFrame(status_rows), use_container_width=True, hide_index=True)
         if mode == "Excel local":
             st.warning(f"Base activa: Excel local. Ruta: {DB_FILE.resolve()}. Si está en Streamlit Cloud, estos datos no se verán en Google Sheets.")
@@ -2254,6 +2305,9 @@ def main() -> None:
 
     stock = calcular_stock(data["Movimientos"], data["Productos"])
     kardex = calcular_kardex_consolidado(data["Movimientos"], data["Productos"])
+    # Mantiene disponible la tabla calculada dentro del diccionario de datos
+    # sin exigir leerla desde Google Sheets al iniciar.
+    data["Kardex_Consolidado"] = ensure_columns(kardex, "Kardex_Consolidado")
     hero(mode, st.session_state.get("nombre_usuario", ""))
     show_flash()
 
