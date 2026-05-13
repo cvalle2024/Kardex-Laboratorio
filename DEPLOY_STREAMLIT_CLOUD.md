@@ -78,6 +78,8 @@ Pegue este bloque, reemplazando los datos por los del JSON de Google Cloud:
 
 ```toml
 USE_GOOGLE_SHEETS = true
+ALLOW_LOCAL_FALLBACK = false
+FORMAT_GOOGLE_SHEETS_AS_TABLE = true
 GOOGLE_SHEET_ID = "PEGUE_AQUI_EL_ID_O_URL_COMPLETA_DE_SU_HOJA_GOOGLE"
 
 [gcp_service_account]
@@ -172,6 +174,7 @@ En V9, use:
 ```toml
 USE_GOOGLE_SHEETS = true
 ALLOW_LOCAL_FALLBACK = false
+FORMAT_GOOGLE_SHEETS_AS_TABLE = true
 ```
 
 Con esta configuración, si Google Sheets falla, el sistema se detiene y muestra el error real.

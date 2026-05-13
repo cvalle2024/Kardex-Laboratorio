@@ -77,6 +77,16 @@ CORE_SHEETS: List[str] = [
 ]
 CALCULATED_SHEETS: List[str] = ["Kardex_Consolidado"]
 
+# Formato visual de tablas en Google Sheets. Google Sheets no maneja las
+# "Tablas" exactamente igual que Excel, pero sí permite dejar cada pestaña
+# con encabezados destacados, filtros, fila congelada, bordes, formatos
+# numéricos/fecha y anchos ordenados mediante la API.
+TABLE_HEADER_COLOR = {"red": 0.043, "green": 0.047, "blue": 0.063}  # #0B0C10
+TABLE_HEADER_TEXT = {"red": 1, "green": 1, "blue": 1}
+TABLE_BORDER_COLOR = {"red": 0.82, "green": 0.86, "blue": 0.90}
+TABLE_BODY_COLOR = {"red": 1, "green": 1, "blue": 1}
+TABLE_ALT_COLOR = {"red": 0.965, "green": 0.976, "blue": 0.988}
+
 TIPOS_MOVIMIENTO = ["Ingreso", "Salida", "Devolución", "Ajuste entrada", "Ajuste salida"]
 TIPOS_POSITIVOS = {"Ingreso", "Devolución", "Ajuste entrada"}
 TIPOS_NEGATIVOS = {"Salida", "Ajuste salida"}
@@ -583,6 +593,7 @@ class GoogleSheetsStorage:
             ) from exc
         self.session = AuthorizedSession(credentials)
         self.base_url = f"https://sheets.googleapis.com/v4/spreadsheets/{self.sheet_id}"
+        self._sheet_ids: Dict[str, int] = {}
 
         # Prepara pestañas con operaciones de escritura. Esto evita la llamada de metadata
         # que estaba disparando el error 429 en open_by_key()/fetch_sheet_metadata.
@@ -632,6 +643,195 @@ class GoogleSheetsStorage:
             f"Último detalle: {last_detail}"
         )
 
+    def _refresh_sheet_ids(self) -> None:
+        """Lee una sola vez los sheetId necesarios para aplicar formato visual.
+
+        Las operaciones de formato de Google Sheets requieren sheetId numérico.
+        Se cachea dentro del objeto para no consumir lecturas de metadata en cada acción.
+        """
+        url = f"{self.base_url}?fields=sheets.properties(sheetId,title)"
+        result = self._request("get", url)
+        mapping = {}
+        for item in result.get("sheets", []) if isinstance(result, dict) else []:
+            props = item.get("properties", {})
+            title = props.get("title")
+            sheet_id = props.get("sheetId")
+            if title and sheet_id is not None:
+                mapping[str(title)] = int(sheet_id)
+        if mapping:
+            self._sheet_ids.update(mapping)
+
+    def _get_sheet_id(self, sheet: str) -> int:
+        if sheet not in self._sheet_ids:
+            self._refresh_sheet_ids()
+        if sheet not in self._sheet_ids:
+            raise RuntimeError(f"No se encontró el sheetId de la pestaña '{sheet}' para aplicar formato.")
+        return int(self._sheet_ids[sheet])
+
+    def _format_requests_for_sheet(self, sheet: str, data_rows: int = 0) -> list:
+        """Construye solicitudes batchUpdate para dejar una pestaña con formato tipo tabla."""
+        sheet_id = self._get_sheet_id(sheet)
+        columns = SHEET_COLUMNS[sheet]
+        col_count = len(columns)
+        # Incluye encabezado + filas con datos y deja un bloque visual disponible
+        # para que nuevos registros con append sigan cayendo dentro del formato/filtro.
+        total_rows = max(int(data_rows) + 1, 200)
+        grid_range = {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": total_rows, "startColumnIndex": 0, "endColumnIndex": col_count}
+        header_range = {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": col_count}
+        body_range = {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": max(total_rows, 2), "startColumnIndex": 0, "endColumnIndex": col_count}
+
+        border = {"style": "SOLID", "width": 1, "color": TABLE_BORDER_COLOR}
+        requests = [
+            {
+                "updateSheetProperties": {
+                    "properties": {"sheetId": sheet_id, "gridProperties": {"frozenRowCount": 1}},
+                    "fields": "gridProperties.frozenRowCount",
+                }
+            },
+            {
+                "repeatCell": {
+                    "range": header_range,
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": TABLE_HEADER_COLOR,
+                            "horizontalAlignment": "CENTER",
+                            "verticalAlignment": "MIDDLE",
+                            "wrapStrategy": "WRAP",
+                            "textFormat": {"bold": True, "fontSize": 10, "foregroundColor": TABLE_HEADER_TEXT},
+                        }
+                    },
+                    "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,wrapStrategy,textFormat)",
+                }
+            },
+            {
+                "repeatCell": {
+                    "range": body_range,
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": TABLE_BODY_COLOR,
+                            "verticalAlignment": "MIDDLE",
+                            "wrapStrategy": "WRAP",
+                            "textFormat": {"fontSize": 9},
+                        }
+                    },
+                    "fields": "userEnteredFormat(backgroundColor,verticalAlignment,wrapStrategy,textFormat)",
+                }
+            },
+            {"setBasicFilter": {"filter": {"range": grid_range}}},
+            {
+                "updateBorders": {
+                    "range": grid_range,
+                    "top": border,
+                    "bottom": border,
+                    "left": border,
+                    "right": border,
+                    "innerHorizontal": border,
+                    "innerVertical": border,
+                }
+            },
+            {
+                "updateDimensionProperties": {
+                    "range": {"sheetId": sheet_id, "dimension": "ROWS", "startIndex": 0, "endIndex": 1},
+                    "properties": {"pixelSize": 34},
+                    "fields": "pixelSize",
+                }
+            },
+            {
+                "autoResizeDimensions": {
+                    "dimensions": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": col_count}
+                }
+            },
+        ]
+
+        # Formatos por tipo de columna.
+        for idx, col in enumerate(columns):
+            key = col.lower()
+            col_range = {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": max(total_rows, 2), "startColumnIndex": idx, "endColumnIndex": idx + 1}
+            if "fecha" in key:
+                requests.append({
+                    "repeatCell": {
+                        "range": col_range,
+                        "cell": {"userEnteredFormat": {"numberFormat": {"type": "DATE", "pattern": "yyyy-mm-dd"}}},
+                        "fields": "userEnteredFormat.numberFormat",
+                    }
+                })
+            elif "porcentaje" in key:
+                requests.append({
+                    "repeatCell": {
+                        "range": col_range,
+                        "cell": {"userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0.0%"}}},
+                        "fields": "userEnteredFormat.numberFormat",
+                    }
+                })
+            elif any(term in key for term in ["cantidad", "costo", "total", "saldo", "stock", "dias", "numero", "salida", "entrada"]):
+                requests.append({
+                    "repeatCell": {
+                        "range": col_range,
+                        "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.##"}}},
+                        "fields": "userEnteredFormat.numberFormat",
+                    }
+                })
+
+            # Anchos máximos para columnas descriptivas que suelen crecer demasiado.
+            if any(term in key for term in ["observacion", "detalle", "direccion"]):
+                requests.append({
+                    "updateDimensionProperties": {
+                        "range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": idx, "endIndex": idx + 1},
+                        "properties": {"pixelSize": 320 if "detalle" in key else 260},
+                        "fields": "pixelSize",
+                    }
+                })
+            elif any(term in key for term in ["producto", "proveedor", "solicitante", "entregado"]):
+                requests.append({
+                    "updateDimensionProperties": {
+                        "range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": idx, "endIndex": idx + 1},
+                        "properties": {"pixelSize": 210},
+                        "fields": "pixelSize",
+                    }
+                })
+
+        return requests
+
+    def apply_table_format(self, sheet: str, data_rows: int = 0, strict: bool = False) -> None:
+        """Aplica encabezado, filtros, fila congelada, bordes y formatos numéricos.
+
+        No bloquea el guardado cuando falla, salvo que strict=True. Así se evita perder
+        registros por un problema menor de presentación.
+        """
+        if not as_bool(safe_secret("FORMAT_GOOGLE_SHEETS_AS_TABLE", True), True):
+            return
+        try:
+            requests = self._format_requests_for_sheet(sheet, data_rows=data_rows)
+            self._request("post", f"{self.base_url}:batchUpdate", json={"requests": requests}, ok_empty=True)
+        except Exception as exc:
+            if strict:
+                raise RuntimeError(f"No se pudo aplicar formato tabla en '{sheet}'. Detalle: {exception_detail(exc)}") from exc
+            try:
+                st.warning(f"Los datos se guardaron, pero no se pudo aplicar el formato tabla en '{sheet}'. Detalle: {exc}")
+            except Exception:
+                pass
+
+    def apply_table_format_all(self, data: Dict[str, pd.DataFrame] | None = None, strict: bool = False) -> None:
+        """Aplica formato tipo tabla a todas las pestañas de la base en una sola operación."""
+        if not as_bool(safe_secret("FORMAT_GOOGLE_SHEETS_AS_TABLE", True), True):
+            return
+        try:
+            all_requests = []
+            for sheet in SHEET_COLUMNS.keys():
+                rows = 0
+                if data is not None and sheet in data:
+                    rows = len(ensure_columns(data.get(sheet, pd.DataFrame()), sheet))
+                all_requests.extend(self._format_requests_for_sheet(sheet, data_rows=rows))
+            if all_requests:
+                self._request("post", f"{self.base_url}:batchUpdate", json={"requests": all_requests}, ok_empty=True)
+        except Exception as exc:
+            if strict:
+                raise RuntimeError(f"No se pudo aplicar formato tabla a Google Sheets. Detalle: {exception_detail(exc)}") from exc
+            try:
+                st.warning(f"No se pudo aplicar formato tabla a todas las pestañas. Detalle: {exc}")
+            except Exception:
+                pass
+
     def _values_url(self, sheet: str, suffix: str = "") -> str:
         rng = quote(sheet_range_for(sheet), safe="")
         return f"{self.base_url}/values/{rng}{suffix}"
@@ -661,7 +861,12 @@ class GoogleSheetsStorage:
             ]
         }
         try:
-            self._request("post", f"{self.base_url}:batchUpdate", json=body, ok_empty=True)
+            result = self._request("post", f"{self.base_url}:batchUpdate", json=body)
+            replies = result.get("replies", []) if isinstance(result, dict) else []
+            if replies:
+                new_sheet_id = replies[0].get("addSheet", {}).get("properties", {}).get("sheetId")
+                if new_sheet_id is not None:
+                    self._sheet_ids[sheet] = int(new_sheet_id)
         except Exception as exc:
             msg = str(exc).lower()
             # Errores esperados si la pestaña ya existe. Se ignoran.
@@ -733,6 +938,7 @@ class GoogleSheetsStorage:
             values = [SHEET_COLUMNS[sheet]] + df.values.tolist()
             update_url = f"{self._values_url(sheet)}?valueInputOption=USER_ENTERED"
             self._request("put", update_url, json={"values": values}, ok_empty=True)
+            self.apply_table_format(sheet, data_rows=len(df), strict=False)
             mark_data_dirty()
         except Exception as exc:
             raise RuntimeError(
@@ -749,6 +955,8 @@ class GoogleSheetsStorage:
         try:
             self._create_sheet_and_header(sheet)
             response = self._request("post", url, json={"values": [values]})
+            # Se actualiza el formato de la pestaña para que el nuevo registro quede dentro del filtro y la tabla visual.
+            self.apply_table_format(sheet, data_rows=0, strict=False)
             mark_data_dirty()
             return response
         except Exception as exc:
@@ -1797,7 +2005,7 @@ def page_kardex_consolidado(kardex: pd.DataFrame, storage=None, data: Dict[str, 
     )
 
     st.markdown("<div class='form-card'>", unsafe_allow_html=True)
-    c_sync, c_msg = st.columns([.9, 2.1])
+    c_sync, c_format, c_msg = st.columns([.95, .95, 2.1])
     with c_sync:
         if storage is not None and data is not None and st.button("🔄 Actualizar hoja Kardex_Consolidado", use_container_width=True):
             try:
@@ -1805,8 +2013,15 @@ def page_kardex_consolidado(kardex: pd.DataFrame, storage=None, data: Dict[str, 
                 st.success("Hoja Kardex_Consolidado actualizada correctamente en la base.")
             except Exception as exc:
                 st.error(f"No se pudo actualizar la hoja Kardex_Consolidado: {exc}")
+    with c_format:
+        if storage is not None and hasattr(storage, "apply_table_format") and st.button("🎨 Formato tabla", use_container_width=True):
+            try:
+                storage.apply_table_format("Kardex_Consolidado", data_rows=len(kardex), strict=True)
+                st.success("Formato tipo tabla aplicado en Kardex_Consolidado.")
+            except Exception as exc:
+                st.error(f"No se pudo aplicar formato tabla: {exc}")
     with c_msg:
-        st.caption("Esta tabla se calcula desde Movimientos. Use el botón para crear/actualizar la pestaña Kardex_Consolidado en Google Sheets cuando necesite verla directamente en la hoja.")
+        st.caption("Esta tabla se calcula desde Movimientos. Use el botón para crear/actualizar la pestaña Kardex_Consolidado en Google Sheets y dejarla con formato tabla.")
     st.markdown("</div>", unsafe_allow_html=True)
 
     if kardex.empty:
@@ -2250,7 +2465,7 @@ def page_admin(storage, data: Dict[str, pd.DataFrame], mode: str) -> None:
     with tab3:
         card_start("Diagnóstico de base y estructura", "Verifica hojas cargadas, conexión activa y evita lecturas innecesarias a Google Sheets.")
         if mode == "Google Sheets":
-            st.info("Modo optimizado V13: conexión por API REST directa, sin open_by_key/metadata, lectura por lotes y caché para reducir el error 429 de cuota.")
+            st.info("Modo optimizado V16: conexión por API REST directa, lectura por lotes, caché y formato tipo tabla en Google Sheets.")
         expected = list(SHEET_COLUMNS.keys())
         status_rows = []
         for sheet in expected:
@@ -2282,6 +2497,16 @@ def page_admin(storage, data: Dict[str, pd.DataFrame], mode: str) -> None:
                     st.success("Kardex_Consolidado actualizado correctamente en Google Sheets.")
                 except Exception as exc:
                     st.error(f"No se pudo sincronizar Kardex_Consolidado: {exc}")
+
+            if hasattr(storage, "apply_table_format_all") and st.button("🎨 Aplicar formato tabla a Google Sheets", use_container_width=True):
+                try:
+                    data_fmt = dict(data)
+                    data_fmt["Kardex_Consolidado"] = calcular_kardex_consolidado(data.get("Movimientos", pd.DataFrame()), data.get("Productos", pd.DataFrame()))
+                    storage.apply_table_format_all(data_fmt, strict=True)
+                    st.success("Formato tipo tabla aplicado correctamente a las pestañas de Google Sheets.")
+                except Exception as exc:
+                    st.error(f"No se pudo aplicar el formato tabla: {exc}")
+                    st.info(diagnose_gsheets_error(exc))
 
 # ============================================================
 # APP PRINCIPAL

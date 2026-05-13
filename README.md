@@ -34,6 +34,28 @@ Esta pestaña muestra el stock actual por producto/lote con entrada total, salid
 
 La hoja se actualiza automáticamente al guardar movimientos, importar datos o modificar productos. También puede sincronizarse manualmente desde el menú **5️⃣ Kardex consolidado** o desde **3️⃣ Administración → Diagnóstico**.
 
+
+### Novedad V16: formato tipo tabla en Google Sheets
+
+Las pestañas de Google Sheets ahora pueden quedar ordenadas visualmente con formato tipo tabla:
+
+- Encabezado oscuro con texto blanco.
+- Filtros por columna.
+- Fila de encabezado congelada.
+- Bordes y ajuste de texto.
+- Autoajuste de columnas.
+- Formatos de fecha, número y porcentaje.
+- Botón manual en **3️⃣ Administración → Diagnóstico → 🎨 Aplicar formato tabla a Google Sheets**.
+- Botón manual en **5️⃣ Kardex consolidado → 🎨 Formato tabla**.
+
+El formato también se aplica automáticamente al guardar información en Google Sheets.
+
+Se puede activar/desactivar con este secreto:
+
+```toml
+FORMAT_GOOGLE_SHEETS_AS_TABLE = true
+```
+
 ## Acceso inicial
 
 Al ejecutar por primera vez, el sistema crea un usuario administrador inicial:
