@@ -160,3 +160,12 @@ Saldo actual = suma de ingresos/devoluciones/ajustes entrada - suma de salidas/a
 ```
 
 El sistema la sincroniza automáticamente al registrar movimientos y ofrece botones de sincronización manual para reconstruirla cuando sea necesario.
+
+
+## Cierre por inactividad y roles
+
+El sistema cierra la sesión después de un periodo sin actividad del usuario. Por defecto son 15 minutos, configurable con `SESSION_TIMEOUT_MINUTES` en Streamlit Secrets.
+
+La navegación se filtra por rol: los usuarios que no son **Administrador** no ven el módulo de Administración/Configuración.
+
+En el login no se muestran credenciales iniciales; el usuario debe ingresar las credenciales asignadas y validar con el PATH temporal generado en pantalla.

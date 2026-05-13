@@ -80,6 +80,7 @@ Pegue este bloque, reemplazando los datos por los del JSON de Google Cloud:
 USE_GOOGLE_SHEETS = true
 ALLOW_LOCAL_FALLBACK = false
 FORMAT_GOOGLE_SHEETS_AS_TABLE = true
+SESSION_TIMEOUT_MINUTES = 15
 GOOGLE_SHEET_ID = "PEGUE_AQUI_EL_ID_O_URL_COMPLETA_DE_SU_HOJA_GOOGLE"
 
 [gcp_service_account]
@@ -175,6 +176,7 @@ En V9, use:
 USE_GOOGLE_SHEETS = true
 ALLOW_LOCAL_FALLBACK = false
 FORMAT_GOOGLE_SHEETS_AS_TABLE = true
+SESSION_TIMEOUT_MINUTES = 15
 ```
 
 Con esta configuración, si Google Sheets falla, el sistema se detiene y muestra el error real.
@@ -188,3 +190,14 @@ Google Sheets limita las lecturas por minuto. La V11 ya minimiza las lecturas; s
 2. Evite presionar varias veces los botones de recarga/reboot.
 3. Verifique que esté usando esta V11 o superior.
 4. Mantenga `ALLOW_LOCAL_FALLBACK = false` en producción para no guardar datos fuera de Google Sheets.
+
+
+## Seguridad de sesión
+
+Para producción se recomienda mantener el cierre automático de sesión por inactividad. El valor predeterminado es 15 minutos y puede modificarse en Streamlit Secrets:
+
+```toml
+SESSION_TIMEOUT_MINUTES = 15
+```
+
+Los usuarios con rol distinto de **Administrador** no verán el módulo de Administración/Configuración en el menú.

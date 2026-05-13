@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import streamlit.components.v1 as components
 
 # ============================================================
 # CONFIGURACIÓN GENERAL
@@ -29,6 +30,7 @@ DEFAULT_PATH_KEY = "DINAMICO"
 DEFAULT_ADMIN_PASSWORD = "admin123"
 PATH_TTL_MINUTES = 10
 PATH_LENGTH = 8
+SESSION_TIMEOUT_MINUTES = 15
 
 KARDEX_CONSOLIDADO_COLUMNS: List[str] = [
     "estado", "producto_id", "producto", "marca", "lote", "unidad",
@@ -1421,7 +1423,7 @@ def hero(storage_mode: str, user_name: str = "") -> None:
         <div class="hero">
             <h1>📦 {APP_TITLE}</h1>
             <p>{APP_SUBTITLE}</p>
-            <div style="margin-top:12px"><span class='pill'>Base activa: {storage_mode}</span>{user_badge}<span class='pill'>Versión 13.0</span></div>
+            <div style="margin-top:12px"><span class='pill'>Base activa: {storage_mode}</span>{user_badge}<span class='pill'>Versión 17.0</span></div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1488,7 +1490,7 @@ def render_login(storage, data: Dict[str, pd.DataFrame], mode: str) -> bool:
         rerun()
 
     with st.form("login_form"):
-        usuario = st.text_input("Usuario", placeholder="Ejemplo: admin")
+        usuario = st.text_input("Usuario", placeholder="Ingrese su usuario")
         password = st.text_input("Contraseña", type="password", placeholder="Ingrese su contraseña")
         path_key = st.text_input(
             "Pegar PATH generado",
@@ -1498,8 +1500,8 @@ def render_login(storage, data: Dict[str, pd.DataFrame], mode: str) -> bool:
         submitted = st.form_submit_button("Ingresar al sistema", use_container_width=True)
 
     st.markdown(
-        "<div class='field-note'>Usuario inicial: <b>admin</b> | Contraseña inicial: <b>admin123</b>. "
-        "El PATH ya no es fijo: se genera automáticamente en esta pantalla y se copia/pega para validar el acceso.</div>",
+        "<div class='field-note'>Ingrese sus credenciales asignadas por el administrador. "
+        "El PATH temporal se genera automáticamente en esta pantalla y se copia/pega para validar el acceso.</div>",
         unsafe_allow_html=True,
     )
     st.markdown("</div></div>", unsafe_allow_html=True)
@@ -1541,7 +1543,7 @@ def render_login(storage, data: Dict[str, pd.DataFrame], mode: str) -> bool:
     return False
 
 def logout() -> None:
-    for key in ["auth_ok", "usuario", "nombre_usuario", "rol", "login_path_code", "login_path_created_at"]:
+    for key in ["auth_ok", "usuario", "nombre_usuario", "rol", "login_path_code", "login_path_created_at", "last_activity_ts"]:
         st.session_state.pop(key, None)
     rerun()
 
@@ -1551,6 +1553,100 @@ def require_admin() -> bool:
         st.warning("Este módulo requiere rol de Administrador.")
         return False
     return True
+
+
+def get_session_timeout_minutes() -> int:
+    """Tiempo máximo de inactividad antes de cerrar sesión.
+
+    Puede cambiarse en Streamlit Secrets con:
+    SESSION_TIMEOUT_MINUTES = 15
+    """
+    raw = safe_secret("SESSION_TIMEOUT_MINUTES", SESSION_TIMEOUT_MINUTES)
+    try:
+        value = int(float(raw))
+    except Exception:
+        value = SESSION_TIMEOUT_MINUTES
+    return max(1, value)
+
+
+def clear_auth_state() -> None:
+    """Limpia únicamente el estado de autenticación de la sesión actual."""
+    for key in [
+        "auth_ok", "usuario", "nombre_usuario", "rol",
+        "login_path_code", "login_path_created_at", "last_activity_ts"
+    ]:
+        st.session_state.pop(key, None)
+
+
+def enforce_inactivity_timeout() -> bool:
+    """Cierra sesión si la sesión autenticada superó el tiempo de inactividad."""
+    if not st.session_state.get("auth_ok"):
+        return False
+
+    now = time.time()
+    timeout_seconds = get_session_timeout_minutes() * 60
+    last_activity = st.session_state.get("last_activity_ts")
+
+    if last_activity is not None:
+        try:
+            elapsed = now - float(last_activity)
+        except Exception:
+            elapsed = 0
+        if elapsed > timeout_seconds:
+            clear_auth_state()
+            set_flash(
+                f"Sesión cerrada por inactividad después de {get_session_timeout_minutes()} minutos. Ingrese nuevamente.",
+                "warning",
+            )
+            rerun()
+            return False
+
+    st.session_state["last_activity_ts"] = now
+    return True
+
+
+def inject_inactivity_watcher() -> None:
+    """Recarga la app cuando el navegador queda sin actividad.
+
+    Streamlit solo ejecuta Python cuando hay una interacción o recarga. Este pequeño
+    script detecta inactividad del lado del navegador y fuerza una recarga; al recargar,
+    Python valida el tiempo transcurrido y cierra la sesión si corresponde.
+    """
+    timeout_ms = get_session_timeout_minutes() * 60 * 1000
+    components.html(
+        f"""
+        <script>
+        (function() {{
+            const timeoutMs = {timeout_ms};
+            const parentWindow = window.parent;
+            const timerKey = "__kardexInactivityTimer";
+            const resetTimer = function() {{
+                if (parentWindow[timerKey]) {{
+                    clearTimeout(parentWindow[timerKey]);
+                }}
+                parentWindow[timerKey] = setTimeout(function() {{
+                    parentWindow.location.reload();
+                }}, timeoutMs + 1000);
+            }};
+            const events = ["mousemove", "mousedown", "keydown", "scroll", "touchstart", "click"];
+            events.forEach(function(eventName) {{
+                parentWindow.addEventListener(eventName, resetTimer, {{passive: true}});
+            }});
+            resetTimer();
+        }})();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
+def allowed_nav_pages_for_role(role: str) -> List[str]:
+    """Devuelve los módulos visibles según el rol del usuario."""
+    pages = list(NAV_PAGES)
+    if clean_str(role) != "Administrador":
+        pages = [p for p in pages if p != PAGE_ADMIN]
+    return pages
 
 
 def generate_dynamic_path_code(length: int = PATH_LENGTH) -> str:
@@ -1644,30 +1740,51 @@ def page_inicio_operativo(data: Dict[str, pd.DataFrame], stock: pd.DataFrame, ka
     st.write("")
     st.markdown("<div class='form-card'>", unsafe_allow_html=True)
     st.markdown("#### Flujo recomendado de uso")
-    flujo_html = """
-    <div style="display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px;">
-        <div class="mini-card"><div class="mini-title">1. Acceso seguro</div><div class="mini-sub">El usuario se loguea con usuario, contraseña y PATH temporal generado automáticamente.</div></div>
-        <div class="mini-card"><div class="mini-title">2. Catálogos base</div><div class="mini-sub">Se registran productos, marcas, unidades, proveedores, solicitantes y personal.</div></div>
-        <div class="mini-card"><div class="mini-title">3. Administración</div><div class="mini-sub">Solo administrador: usuarios, roles, seguridad PATH y diagnóstico de base.</div></div>
-        <div class="mini-card"><div class="mini-title">4. Operación diaria</div><div class="mini-sub">Ingresos, salidas, devoluciones y ajustes. El formulario toma datos del catálogo.</div></div>
-        <div class="mini-card"><div class="mini-title">5. Control Kardex</div><div class="mini-sub">Una fila por producto/lote con entrada, salida acumulada, saldo y último destino.</div></div>
-        <div class="mini-card"><div class="mini-title">6. Reportes</div><div class="mini-sub">Stock, alertas, movimientos, Kardex consolidado y exportación a Excel.</div></div>
-    </div>
-    """
+    if st.session_state.get("rol") == "Administrador":
+        flujo_html = """
+        <div style="display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px;">
+            <div class="mini-card"><div class="mini-title">1. Acceso seguro</div><div class="mini-sub">El usuario se loguea con usuario, contraseña y PATH temporal generado automáticamente.</div></div>
+            <div class="mini-card"><div class="mini-title">2. Catálogos base</div><div class="mini-sub">Se registran productos, marcas, unidades, proveedores, solicitantes y personal.</div></div>
+            <div class="mini-card"><div class="mini-title">3. Administración</div><div class="mini-sub">Solo administrador: usuarios, roles, seguridad PATH y diagnóstico de base.</div></div>
+            <div class="mini-card"><div class="mini-title">4. Operación diaria</div><div class="mini-sub">Ingresos, salidas, devoluciones y ajustes. El formulario toma datos del catálogo.</div></div>
+            <div class="mini-card"><div class="mini-title">5. Control Kardex</div><div class="mini-sub">Una fila por producto/lote con entrada, salida acumulada, saldo y último destino.</div></div>
+            <div class="mini-card"><div class="mini-title">6. Reportes</div><div class="mini-sub">Stock, alertas, movimientos, Kardex consolidado y exportación a Excel.</div></div>
+        </div>
+        """
+    else:
+        flujo_html = """
+        <div style="display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px;">
+            <div class="mini-card"><div class="mini-title">1. Acceso seguro</div><div class="mini-sub">El usuario se loguea con sus credenciales y PATH temporal generado automáticamente.</div></div>
+            <div class="mini-card"><div class="mini-title">2. Catálogos base</div><div class="mini-sub">Consulte o complete los catálogos permitidos según su rol operativo.</div></div>
+            <div class="mini-card"><div class="mini-title">3. Operación diaria</div><div class="mini-sub">Registre ingresos, salidas, devoluciones y ajustes. El formulario toma datos del catálogo.</div></div>
+            <div class="mini-card"><div class="mini-title">4. Control Kardex</div><div class="mini-sub">Revise existencia por producto/lote, salida acumulada, saldo y último destino.</div></div>
+            <div class="mini-card"><div class="mini-title">5. Stock y alertas</div><div class="mini-sub">Consulte vencimientos, stock bajo y existencias disponibles.</div></div>
+            <div class="mini-card"><div class="mini-title">6. Reportes</div><div class="mini-sub">Genere reportes operativos y exportaciones autorizadas.</div></div>
+        </div>
+        """
     st.markdown(flujo_html, unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("<div class='form-card'>", unsafe_allow_html=True)
     st.markdown("#### Accesos rápidos según la ruta")
-    a, b, c, d = st.columns(4)
-    if a.button("📚 Catálogos base", use_container_width=True):
-        nav_go(PAGE_CATALOGOS)
-    if b.button("🔐 Administración", use_container_width=True):
-        nav_go(PAGE_ADMIN)
-    if c.button("🔁 Registrar movimientos", use_container_width=True):
-        nav_go(PAGE_MOVIMIENTOS)
-    if d.button("📊 Reportes", use_container_width=True):
-        nav_go(PAGE_REPORTES)
+    if st.session_state.get("rol") == "Administrador":
+        a, b, c, d = st.columns(4)
+        if a.button("📚 Catálogos base", use_container_width=True):
+            nav_go(PAGE_CATALOGOS)
+        if b.button("🔐 Administración", use_container_width=True):
+            nav_go(PAGE_ADMIN)
+        if c.button("🔁 Registrar movimientos", use_container_width=True):
+            nav_go(PAGE_MOVIMIENTOS)
+        if d.button("📊 Reportes", use_container_width=True):
+            nav_go(PAGE_REPORTES)
+    else:
+        a, b, c = st.columns(3)
+        if a.button("📚 Catálogos base", use_container_width=True):
+            nav_go(PAGE_CATALOGOS)
+        if b.button("🔁 Registrar movimientos", use_container_width=True):
+            nav_go(PAGE_MOVIMIENTOS)
+        if c.button("📊 Reportes", use_container_width=True):
+            nav_go(PAGE_REPORTES)
     st.write("")
     if st.button(f"➡️ {boton_texto}", use_container_width=True):
         nav_go(boton_page)
@@ -2526,7 +2643,12 @@ def main() -> None:
         st.stop()
 
     if not render_login(storage, data, mode):
+        show_flash()
         return
+
+    if not enforce_inactivity_timeout():
+        return
+    inject_inactivity_watcher()
 
     stock = calcular_stock(data["Movimientos"], data["Productos"])
     kardex = calcular_kardex_consolidado(data["Movimientos"], data["Productos"])
@@ -2536,7 +2658,8 @@ def main() -> None:
     hero(mode, st.session_state.get("nombre_usuario", ""))
     show_flash()
 
-    if "page" not in st.session_state or st.session_state["page"] not in NAV_PAGES:
+    allowed_pages = allowed_nav_pages_for_role(st.session_state.get("rol", ""))
+    if "page" not in st.session_state or st.session_state["page"] not in allowed_pages:
         st.session_state["page"] = PAGE_INICIO
 
     with st.sidebar:
@@ -2548,14 +2671,14 @@ def main() -> None:
         st.caption("Siga la ruta de arriba hacia abajo para no perderse en el proceso.")
         page = st.radio(
             "Seleccione módulo",
-            NAV_PAGES,
-            index=NAV_PAGES.index(st.session_state["page"]),
+            allowed_pages,
+            index=allowed_pages.index(st.session_state["page"]),
             label_visibility="collapsed",
         )
         st.session_state["page"] = page
         st.divider()
         st.markdown("**Estructura lógica**")
-        st.caption("1. Acceso → 2. Catálogos → 3. Administración → 4. Movimientos → 5. Kardex/Stock → 6. Reportes")
+        st.caption("1. Acceso → 2. Catálogos → 3. Movimientos → 4. Kardex/Stock → 5. Reportes")
         st.divider()
         if st.button("Cerrar sesión", use_container_width=True):
             logout()
@@ -2565,7 +2688,7 @@ def main() -> None:
         page_inicio_operativo(data, stock, kardex, mode)
     elif page == PAGE_CATALOGOS:
         page_catalogos(storage, data)
-    elif page == PAGE_ADMIN:
+    elif page == PAGE_ADMIN and st.session_state.get("rol") == "Administrador":
         page_admin(storage, data, mode)
     elif page == PAGE_MOVIMIENTOS:
         page_movimiento(storage, data, stock)

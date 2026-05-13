@@ -56,6 +56,20 @@ Se puede activar/desactivar con este secreto:
 FORMAT_GOOGLE_SHEETS_AS_TABLE = true
 ```
 
+
+
+### Novedad V17: seguridad de sesión y navegación por rol
+
+- Cierre automático de sesión por inactividad. El tiempo predeterminado es de 15 minutos.
+- Se puede ajustar desde Streamlit Secrets con:
+
+```toml
+SESSION_TIMEOUT_MINUTES = 15
+```
+
+- Los usuarios que no tienen rol **Administrador** ya no ven el módulo **Administración** en el menú lateral ni en los accesos rápidos.
+- La pantalla de login ya no muestra el usuario ni la contraseña inicial; solo solicita las credenciales asignadas y el PATH temporal generado automáticamente.
+
 ## Acceso inicial
 
 Al ejecutar por primera vez, el sistema crea un usuario administrador inicial:
@@ -65,7 +79,7 @@ Usuario: admin
 Contraseña: admin123
 ```
 
-En la pantalla de login el sistema mostrará un apartado llamado **Código PATH generado**. Copie ese código y péguelo en el campo **Pegar PATH generado** para completar el acceso. El código es temporal y se puede regenerar desde el mismo login.
+En la pantalla de login el sistema mostrará un apartado llamado **Código PATH generado**. Copie ese código y péguelo en el campo **Pegar PATH generado** para completar el acceso. El código es temporal y se puede regenerar desde el mismo login. Por seguridad, la pantalla de login no muestra el usuario ni la contraseña inicial.
 
 ## Qué incluye
 
