@@ -21,6 +21,19 @@ Sistema web para control de reactivos e insumos con base de datos en Excel local
 - Validaciones más claras para evitar salidas mayores al stock disponible.
 - Mantenimiento de catálogos con formulario ordenado y tabla editable para ajustes masivos.
 
+
+### Novedad V13: Kardex consolidado físico en Google Sheets
+
+Además de verse dentro del sistema, la vista **Kardex consolidado por lote** ahora se guarda también como una pestaña real en la base de datos:
+
+```text
+Kardex_Consolidado
+```
+
+Esta pestaña muestra el stock actual por producto/lote con entrada total, salida acumulada, saldo actual, último destinatario, fecha de última salida y detalle de entregas.
+
+La hoja se actualiza automáticamente al guardar movimientos, importar datos o modificar productos. También puede sincronizarse manualmente desde el menú **5️⃣ Kardex consolidado** o desde **3️⃣ Administración → Diagnóstico**.
+
 ## Acceso inicial
 
 Al ejecutar por primera vez, el sistema crea un usuario administrador inicial:

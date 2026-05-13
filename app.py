@@ -30,6 +30,14 @@ DEFAULT_ADMIN_PASSWORD = "admin123"
 PATH_TTL_MINUTES = 10
 PATH_LENGTH = 8
 
+KARDEX_CONSOLIDADO_COLUMNS: List[str] = [
+    "estado", "producto_id", "producto", "marca", "lote", "unidad",
+    "fecha_ingreso", "proveedor_ingreso", "fecha_elaboracion", "fecha_vencimiento",
+    "entrada_total", "salida_total", "saldo_actual", "porcentaje_consumido",
+    "numero_salidas", "fecha_ultima_salida", "ultimo_entregado_a", "ultimo_personal_entrega",
+    "detalle_salidas", "observacion_ingreso", "dias_para_vencer", "stock_minimo",
+]
+
 SHEET_COLUMNS: Dict[str, List[str]] = {
     "Productos": [
         "producto_id", "codigo_producto", "nombre_producto", "categoria", "marca_default",
@@ -54,6 +62,9 @@ SHEET_COLUMNS: Dict[str, List[str]] = {
         "proveedor", "solicitante", "personal", "fecha_elaboracion", "fecha_vencimiento",
         "unidad", "cantidad", "costo_total", "observacion", "usuario_registro", "fecha_registro"
     ],
+    # Hoja física en Google Sheets/Excel. Se calcula automáticamente desde Movimientos.
+    # Esta hoja permite ver el stock actual en la misma base, sin depender solo de la vista de Streamlit.
+    "Kardex_Consolidado": KARDEX_CONSOLIDADO_COLUMNS,
     "Config": ["clave", "valor"],
 }
 
@@ -198,13 +209,14 @@ INITIAL_DATA: Dict[str, pd.DataFrame] = {
             "fecha_registro": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
         },
     ], columns=SHEET_COLUMNS["Movimientos"]),
+    "Kardex_Consolidado": pd.DataFrame(columns=SHEET_COLUMNS["Kardex_Consolidado"]),
     "Config": pd.DataFrame([
         {"clave": "dias_alerta_global", "valor": "90"},
         {"clave": "moneda", "valor": "L"},
         {"clave": "institucion", "valor": "Proyecto VIHCA"},
         {"clave": "path_verificacion", "valor": "DINAMICO"},
         {"clave": "path_ttl_minutos", "valor": str(PATH_TTL_MINUTES)},
-        {"clave": "version_sistema", "valor": "12.0"},
+        {"clave": "version_sistema", "valor": "14.0"},
     ], columns=SHEET_COLUMNS["Config"]),
 }
 
@@ -216,6 +228,37 @@ def rerun() -> None:
         st.rerun()
     else:  # pragma: no cover
         st.experimental_rerun()
+
+
+def set_flash(message: str, level: str = "success") -> None:
+    """Guarda un mensaje temporal para mostrarlo después del rerun.
+
+    Streamlit vuelve a ejecutar la app después de guardar; si usamos st.success()
+    antes del rerun, el usuario casi no alcanza a ver la confirmación.
+    Este helper conserva el mensaje y lo muestra una vez en la siguiente carga.
+    """
+    st.session_state["flash_message"] = {"level": level, "message": message}
+
+
+def show_flash() -> None:
+    flash = st.session_state.pop("flash_message", None)
+    if not flash:
+        return
+    level = flash.get("level", "success")
+    message = flash.get("message", "")
+    if level == "success":
+        st.success(message, icon="✅")
+    elif level == "warning":
+        st.warning(message, icon="⚠️")
+    elif level == "error":
+        st.error(message, icon="🚫")
+    else:
+        st.info(message, icon="ℹ️")
+
+
+def bump_form_nonce(name: str) -> None:
+    """Cambia la clave de un formulario para limpiar textboxes tras guardar."""
+    st.session_state[name] = int(st.session_state.get(name, 0)) + 1
 
 
 def clean_str(value) -> str:
@@ -451,8 +494,9 @@ class LocalExcelStorage:
     def ensure_database(self) -> None:
         if not self.path.exists():
             with pd.ExcelWriter(self.path, engine="openpyxl") as writer:
-                for sheet, df in INITIAL_DATA.items():
-                    ensure_columns(df, sheet).to_excel(writer, index=False, sheet_name=sheet)
+                for sheet, columns in SHEET_COLUMNS.items():
+                    base_df = INITIAL_DATA.get(sheet, pd.DataFrame(columns=columns))
+                    ensure_columns(base_df, sheet).to_excel(writer, index=False, sheet_name=sheet)
             return
 
         existing = pd.ExcelFile(self.path).sheet_names
@@ -485,7 +529,7 @@ class LocalExcelStorage:
 class GoogleSheetsStorage:
     """Almacenamiento Google Sheets optimizado por API REST directa.
 
-    Mejoras V12:
+    Mejoras V13:
     - Ya no usa open_by_key() ni worksheet(), porque esas llamadas hacen lecturas de metadata.
     - Lee todas las pestañas con values:batchGet en una sola petición.
     - Guarda con endpoints de values update/append.
@@ -795,13 +839,7 @@ def calcular_stock(df_mov: pd.DataFrame, df_prod: pd.DataFrame) -> pd.DataFrame:
 
 
 def kardex_consolidado_columns() -> List[str]:
-    return [
-        "estado", "producto_id", "producto", "marca", "lote", "unidad",
-        "fecha_ingreso", "proveedor_ingreso", "fecha_elaboracion", "fecha_vencimiento",
-        "entrada_total", "salida_total", "saldo_actual", "porcentaje_consumido",
-        "numero_salidas", "fecha_ultima_salida", "ultimo_entregado_a", "ultimo_personal_entrega",
-        "detalle_salidas", "observacion_ingreso", "dias_para_vencer", "stock_minimo",
-    ]
+    return KARDEX_CONSOLIDADO_COLUMNS.copy()
 
 
 def first_non_empty(series) -> str:
@@ -947,6 +985,19 @@ def calcular_kardex_consolidado(df_mov: pd.DataFrame, df_prod: pd.DataFrame) -> 
     kardex["numero_salidas"] = to_number(kardex.get("numero_salidas", pd.Series(dtype=float))).astype(int)
     kardex = kardex.sort_values(["estado", "producto", "fecha_vencimiento", "lote"], na_position="last")
     return kardex[columns]
+
+
+def sync_kardex_consolidado_sheet(storage, data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Actualiza la hoja física Kardex_Consolidado en Google Sheets/Excel.
+
+    La tabla consolidada no se digita manualmente: se recalcula desde Movimientos y
+    Productos para reflejar entrada total, salida acumulada y saldo actual por lote.
+    """
+    movimientos = ensure_columns(data.get("Movimientos", pd.DataFrame()), "Movimientos")
+    productos = ensure_columns(data.get("Productos", pd.DataFrame()), "Productos")
+    kardex = calcular_kardex_consolidado(movimientos, productos)
+    storage.save("Kardex_Consolidado", ensure_columns(kardex, "Kardex_Consolidado"))
+    return kardex
 
 
 def resumen_kpis(stock: pd.DataFrame, movimientos: pd.DataFrame) -> Dict[str, int | float]:
@@ -1115,7 +1166,7 @@ def hero(storage_mode: str, user_name: str = "") -> None:
         <div class="hero">
             <h1>📦 {APP_TITLE}</h1>
             <p>{APP_SUBTITLE}</p>
-            <div style="margin-top:12px"><span class='pill'>Base activa: {storage_mode}</span>{user_badge}<span class='pill'>Versión 9.0</span></div>
+            <div style="margin-top:12px"><span class='pill'>Base activa: {storage_mode}</span>{user_badge}<span class='pill'>Versión 13.0</span></div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1225,7 +1276,7 @@ def render_login(storage, data: Dict[str, pd.DataFrame], mode: str) -> bool:
         st.session_state["nombre_usuario"] = clean_str(user_row.get("nombre", usuario))
         st.session_state["rol"] = clean_str(user_row.get("rol", "Operador"))
         clear_dynamic_login_path()
-        st.success("Acceso autorizado.")
+        set_flash("Acceso autorizado. Bienvenido al sistema Kardex PRO.")
         rerun()
     else:
         if not valid_password:
@@ -1563,7 +1614,8 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
     # 2) Datos del movimiento: datos generales y lote
     # ========================================================
     st.markdown("<div class='form-card'>", unsafe_allow_html=True)
-    with st.form("frm_movimiento", clear_on_submit=False):
+    mov_nonce = int(st.session_state.get("mov_form_nonce", 0))
+    with st.form(f"frm_movimiento_{mov_nonce}", clear_on_submit=True):
         st.markdown("#### 2) Datos del movimiento")
         col_a, col_b, col_c = st.columns([1, 1, 1])
         fecha = col_a.date_input("Fecha del movimiento", value=TODAY.date())
@@ -1590,21 +1642,21 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             marca = col1.text_input(
                 "Marca",
                 value=marca_default,
-                key=f"mov_marca_{tipo}_{producto_id}",
+                key=f"mov_marca_{mov_nonce}_{tipo}_{producto_id}",
                 help="Se carga desde el catálogo del producto."
             )
-            lote = col2.text_input("Lote *", placeholder="Ejemplo: AB-2026-001", key=f"mov_lote_{tipo}_{producto_id}")
+            lote = col2.text_input("Lote *", placeholder="Ejemplo: AB-2026-001", key=f"mov_lote_{mov_nonce}_{tipo}_{producto_id}")
             unidad = col3.selectbox(
                 "Unidad",
                 unidades,
                 index=unidad_index,
-                key=f"mov_unidad_{tipo}_{producto_id}",
+                key=f"mov_unidad_{mov_nonce}_{tipo}_{producto_id}",
                 help="Se carga desde el catálogo del producto."
             )
             col4, col5, col6 = st.columns([1, 1, 1])
-            fecha_elaboracion_dt = col4.date_input("Fecha de elaboración", value=TODAY.date(), key=f"mov_elab_{tipo}_{producto_id}")
-            fecha_vencimiento_dt = col5.date_input("Fecha de vencimiento", value=(TODAY + pd.Timedelta(days=365)).date(), key=f"mov_venc_{tipo}_{producto_id}")
-            costo_total = col6.number_input("Costo total", min_value=0.0, step=1.0, format="%.2f", key=f"mov_costo_{tipo}_{producto_id}")
+            fecha_elaboracion_dt = col4.date_input("Fecha de elaboración", value=TODAY.date(), key=f"mov_elab_{mov_nonce}_{tipo}_{producto_id}")
+            fecha_vencimiento_dt = col5.date_input("Fecha de vencimiento", value=(TODAY + pd.Timedelta(days=365)).date(), key=f"mov_venc_{mov_nonce}_{tipo}_{producto_id}")
+            costo_total = col6.number_input("Costo total", min_value=0.0, step=1.0, format="%.2f", key=f"mov_costo_{mov_nonce}_{tipo}_{producto_id}")
             fecha_elaboracion = fecha_elaboracion_dt.strftime("%Y-%m-%d")
             fecha_vencimiento = fecha_vencimiento_dt.strftime("%Y-%m-%d")
 
@@ -1674,15 +1726,42 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             "fecha_registro": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         storage.append_row("Movimientos", row)
-        st.success("Movimiento guardado correctamente.")
+
+        # Actualizar hoja física Kardex_Consolidado para que el stock actual
+        # también quede visible en Google Sheets/Excel y no solo dentro de Streamlit.
+        sync_data = dict(data)
+        sync_data["Movimientos"] = ensure_columns(
+            pd.concat([ensure_columns(data["Movimientos"], "Movimientos"), pd.DataFrame([row])], ignore_index=True),
+            "Movimientos",
+        )
+        try:
+            sync_kardex_consolidado_sheet(storage, sync_data)
+            set_flash("Movimiento guardado correctamente. El formulario quedó limpio y el Kardex consolidado fue actualizado en la hoja de base.")
+        except Exception as exc:
+            set_flash(f"Movimiento guardado. El formulario quedó limpio, pero no se pudo actualizar la hoja Kardex_Consolidado: {exc}", "warning")
+        bump_form_nonce("mov_form_nonce")
         rerun()
 
 
-def page_kardex_consolidado(kardex: pd.DataFrame) -> None:
+def page_kardex_consolidado(kardex: pd.DataFrame, storage=None, data: Dict[str, pd.DataFrame] | None = None, mode: str = "") -> None:
     section_header(
         "📋 Kardex consolidado por lote",
         "Una fila por producto/lote: ingreso, salida acumulada, último destinatario, fecha de entrega y saldo actual."
     )
+
+    st.markdown("<div class='form-card'>", unsafe_allow_html=True)
+    c_sync, c_msg = st.columns([.9, 2.1])
+    with c_sync:
+        if storage is not None and data is not None and st.button("🔄 Actualizar hoja Kardex_Consolidado", use_container_width=True):
+            try:
+                sync_kardex_consolidado_sheet(storage, data)
+                st.success("Hoja Kardex_Consolidado actualizada correctamente en la base.")
+            except Exception as exc:
+                st.error(f"No se pudo actualizar la hoja Kardex_Consolidado: {exc}")
+    with c_msg:
+        st.caption("Esta tabla se calcula desde Movimientos. Use el botón para crear/actualizar la pestaña Kardex_Consolidado en Google Sheets cuando necesite verla directamente en la hoja.")
+    st.markdown("</div>", unsafe_allow_html=True)
+
     if kardex.empty:
         st.info("No hay movimientos registrados para consolidar.")
         return
@@ -1836,7 +1915,7 @@ def save_new_product(storage, data, values: dict) -> None:
 
 def product_form(storage, data: Dict[str, pd.DataFrame]) -> None:
     card_start("Nuevo producto", "Registre productos con stock mínimo y días de alerta por vencimiento.")
-    with st.form("frm_producto"):
+    with st.form("frm_producto", clear_on_submit=True):
         c1, c2 = st.columns([1, 2])
         codigo = c1.text_input("Código interno", placeholder="Ejemplo: HIV-RAP-001")
         nombre = c2.text_input("Nombre del producto *", placeholder="Nombre completo del reactivo o insumo")
@@ -1865,13 +1944,13 @@ def product_form(storage, data: Dict[str, pd.DataFrame]) -> None:
             "activo": activo,
             "observacion": observacion,
         })
-        st.success("Producto guardado correctamente.")
+        set_flash("Producto guardado correctamente. El formulario quedó limpio para registrar un nuevo producto.")
         rerun()
 
 
 def provider_form(storage, data: Dict[str, pd.DataFrame]) -> None:
     card_start("Nuevo proveedor", "Formulario ordenado por datos generales, contacto y ubicación.")
-    with st.form("frm_proveedor"):
+    with st.form("frm_proveedor", clear_on_submit=True):
         st.markdown("##### Datos generales")
         c1, c2 = st.columns([2, 1])
         proveedor = c1.text_input("Nombre del proveedor *", placeholder="Nombre comercial o razón social")
@@ -1904,13 +1983,13 @@ def provider_form(storage, data: Dict[str, pd.DataFrame]) -> None:
             "activo": activo,
         }
         storage.append_row("Proveedores", row)
-        st.success("Proveedor guardado correctamente.")
+        set_flash("Proveedor guardado correctamente. El formulario quedó limpio para registrar un nuevo proveedor.")
         rerun()
 
 
 def requester_form(storage, data: Dict[str, pd.DataFrame]) -> None:
     card_start("Nuevo solicitante / unidad", "Registre unidades, áreas o sitios que pueden solicitar productos.")
-    with st.form("frm_solicitante"):
+    with st.form("frm_solicitante", clear_on_submit=True):
         c1, c2, c3 = st.columns([2, 1, 1])
         unidad = c1.text_input("Unidad solicitante *", placeholder="Ejemplo: Hospital, laboratorio, componente, sitio")
         departamento = c2.text_input("Departamento")
@@ -1937,13 +2016,13 @@ def requester_form(storage, data: Dict[str, pd.DataFrame]) -> None:
             "activo": activo,
         }
         storage.append_row("Solicitantes", row)
-        st.success("Solicitante guardado correctamente.")
+        set_flash("Solicitante guardado correctamente. El formulario quedó limpio para registrar una nueva unidad solicitante.")
         rerun()
 
 
 def staff_form(storage, data: Dict[str, pd.DataFrame]) -> None:
     card_start("Nuevo personal", "Usuarios operativos que reciben, entregan o registran movimientos.")
-    with st.form("frm_personal"):
+    with st.form("frm_personal", clear_on_submit=True):
         c1, c2, c3, c4 = st.columns([2, 1, 1.4, .8])
         nombre = c1.text_input("Nombre completo *")
         cargo = c2.text_input("Cargo")
@@ -1963,7 +2042,7 @@ def staff_form(storage, data: Dict[str, pd.DataFrame]) -> None:
             "activo": activo,
         }
         storage.append_row("Personal", row)
-        st.success("Personal guardado correctamente.")
+        set_flash("Personal guardado correctamente. El formulario quedó limpio para registrar un nuevo personal.")
         rerun()
 
 
@@ -1980,8 +2059,18 @@ def catalog_editor(storage, data: Dict[str, pd.DataFrame], sheet: str, title: st
         if search:
             st.warning("Para guardar edición masiva, quite el filtro de búsqueda para evitar perder filas no visibles.")
             return
-        storage.save(sheet, ensure_columns(pd.DataFrame(edited), sheet))
-        st.success(f"{title} actualizado correctamente.")
+        edited_df = ensure_columns(pd.DataFrame(edited), sheet)
+        storage.save(sheet, edited_df)
+        if sheet == "Productos":
+            sync_data = dict(data)
+            sync_data["Productos"] = edited_df
+            try:
+                sync_kardex_consolidado_sheet(storage, sync_data)
+                set_flash(f"{title} actualizado correctamente. Kardex consolidado sincronizado.")
+            except Exception as exc:
+                set_flash(f"{title} actualizado, pero no se pudo sincronizar Kardex_Consolidado: {exc}", "warning")
+        else:
+            set_flash(f"{title} actualizado correctamente.")
         rerun()
 
 
@@ -2026,9 +2115,18 @@ def page_importar(storage, data: Dict[str, pd.DataFrame]) -> None:
                 prod_actual = data["Productos"]
                 prod_final = pd.concat([prod_actual, prod_new], ignore_index=True).drop_duplicates("nombre_producto", keep="first")
                 mov_final = pd.concat([data["Movimientos"], mov_new], ignore_index=True)
-                storage.save("Productos", ensure_columns(prod_final, "Productos"))
-                storage.save("Movimientos", ensure_columns(mov_final, "Movimientos"))
-                st.success("Importación completada.")
+                prod_final = ensure_columns(prod_final, "Productos")
+                mov_final = ensure_columns(mov_final, "Movimientos")
+                storage.save("Productos", prod_final)
+                storage.save("Movimientos", mov_final)
+                sync_data = dict(data)
+                sync_data["Productos"] = prod_final
+                sync_data["Movimientos"] = mov_final
+                try:
+                    sync_kardex_consolidado_sheet(storage, sync_data)
+                    set_flash("Importación completada. Kardex consolidado actualizado en la hoja de base.")
+                except Exception as exc:
+                    set_flash(f"Importación completada, pero no se pudo actualizar Kardex_Consolidado: {exc}", "warning")
                 rerun()
         except Exception as exc:
             st.error(f"No se pudo importar el archivo. Revise que tenga la hoja MOVIMIENTO con la estructura esperada. Detalle: {exc}")
@@ -2043,7 +2141,7 @@ def page_admin(storage, data: Dict[str, pd.DataFrame], mode: str) -> None:
 
     with tab1:
         card_start("Crear usuario", "Asigne rol y credenciales de acceso.")
-        with st.form("frm_usuario"):
+        with st.form("frm_usuario", clear_on_submit=True):
             c1, c2, c3 = st.columns([1, 1.5, 1])
             usuario = c1.text_input("Usuario *")
             nombre = c2.text_input("Nombre completo *")
@@ -2073,7 +2171,7 @@ def page_admin(storage, data: Dict[str, pd.DataFrame], mode: str) -> None:
                         "fecha_creacion": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
                     }
                     storage.append_row("Usuarios", row)
-                    st.success("Usuario creado correctamente.")
+                    set_flash("Usuario creado correctamente. El formulario quedó limpio para crear otro usuario.")
                     rerun()
 
         card_start("Usuarios registrados", "Por seguridad no se muestra la contraseña ni el hash completo.")
@@ -2105,7 +2203,7 @@ def page_admin(storage, data: Dict[str, pd.DataFrame], mode: str) -> None:
     with tab3:
         card_start("Diagnóstico de base y estructura", "Verifica hojas cargadas, conexión activa y evita lecturas innecesarias a Google Sheets.")
         if mode == "Google Sheets":
-            st.info("Modo optimizado V12: conexión por API REST directa, sin open_by_key/metadata, lectura por lotes y caché para reducir el error 429 de cuota.")
+            st.info("Modo optimizado V13: conexión por API REST directa, sin open_by_key/metadata, lectura por lotes y caché para reducir el error 429 de cuota.")
         expected = list(SHEET_COLUMNS.keys())
         status_rows = []
         for sheet in expected:
@@ -2127,6 +2225,12 @@ def page_admin(storage, data: Dict[str, pd.DataFrame], mode: str) -> None:
                 except Exception as exc:
                     st.error(f"No se pudo escribir en Google Sheets: {exc}")
                     st.info(diagnose_gsheets_error(exc))
+            if st.button("🔄 Crear/actualizar hoja Kardex_Consolidado", use_container_width=True):
+                try:
+                    sync_kardex_consolidado_sheet(storage, data)
+                    st.success("Kardex_Consolidado actualizado correctamente en Google Sheets.")
+                except Exception as exc:
+                    st.error(f"No se pudo sincronizar Kardex_Consolidado: {exc}")
 
 # ============================================================
 # APP PRINCIPAL
@@ -2151,6 +2255,7 @@ def main() -> None:
     stock = calcular_stock(data["Movimientos"], data["Productos"])
     kardex = calcular_kardex_consolidado(data["Movimientos"], data["Productos"])
     hero(mode, st.session_state.get("nombre_usuario", ""))
+    show_flash()
 
     if "page" not in st.session_state or st.session_state["page"] not in NAV_PAGES:
         st.session_state["page"] = PAGE_INICIO
@@ -2186,7 +2291,7 @@ def main() -> None:
     elif page == PAGE_MOVIMIENTOS:
         page_movimiento(storage, data, stock)
     elif page == PAGE_KARDEX:
-        page_kardex_consolidado(kardex)
+        page_kardex_consolidado(kardex, storage, data, mode)
     elif page == PAGE_STOCK:
         page_stock(stock)
     elif page == PAGE_DASHBOARD:

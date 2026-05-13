@@ -137,3 +137,26 @@ El sistema puede exportar un Excel con:
 ## Seguridad de acceso
 
 El sistema utiliza usuario y contraseña más un PATH temporal. En cada pantalla de login se genera un código en formato `KDX-XXXX-XXXX`; el usuario debe copiarlo y pegarlo en el campo de verificación. Este PATH no se configura manualmente en usuarios ni en administración, reduciendo el uso de claves fijas compartidas.
+
+## Hoja calculada: Kardex_Consolidado
+
+La hoja `Kardex_Consolidado` se guarda físicamente en Google Sheets/Excel, pero su contenido se calcula desde la bitácora `Movimientos` y el catálogo `Productos`.
+
+No debe editarse manualmente. Su función es mostrar una fila por producto/lote con:
+
+- Entrada total
+- Salida acumulada
+- Saldo actual
+- Último entregado a
+- Fecha última salida
+- Personal que entregó
+- Detalle de salidas
+- Estado del lote
+
+La fórmula lógica es:
+
+```text
+Saldo actual = suma de ingresos/devoluciones/ajustes entrada - suma de salidas/ajustes salida
+```
+
+El sistema la sincroniza automáticamente al registrar movimientos y ofrece botones de sincronización manual para reconstruirla cuando sea necesario.
