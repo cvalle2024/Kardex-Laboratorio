@@ -6,6 +6,7 @@ import secrets
 import string
 import time
 import uuid
+import unicodedata
 from io import BytesIO
 import base64
 from pathlib import Path
@@ -1049,22 +1050,76 @@ def load_all(storage, mode: str = "") -> Dict[str, pd.DataFrame]:
     return data
 
 
+
+def normalize_movement_text(value) -> str:
+    """Normaliza textos de tipo de movimiento para reconocer bases antiguas/manuales.
+
+    Google Sheets puede contener valores escritos como Entrada, ENTRADA, ingreso,
+    salida de insumo, ajuste salida, corrección entrada, etc. Esta función elimina
+    acentos, espacios dobles y diferencias de mayúsculas para clasificar mejor.
+    """
+    text = clean_str(value).lower()
+    text = ''.join(ch for ch in unicodedata.normalize('NFKD', text) if not unicodedata.combining(ch))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def movimiento_sign(value) -> int:
+    """Devuelve 1 si suma stock, -1 si resta stock y 0 si no clasifica.
+
+    Se mantiene compatibilidad con las versiones anteriores que usaban Ajuste,
+    y con registros escritos manualmente en Google Sheets como Entrada/Salida.
+    """
+    text = normalize_movement_text(value)
+    if not text:
+        return 0
+
+    # Primero se revisan los casos que restan para evitar confusiones con frases largas.
+    if any(token in text for token in ["salida", "egreso", "entrega", "despacho"]):
+        return -1
+
+    if "devol" in text:
+        return 1
+
+    if any(token in text for token in ["ingreso", "entrada", "recepcion", "recepción", "compra"]):
+        return 1
+
+    # Compatibilidad con ajustes/correcciones escritos de diferentes formas.
+    if any(token in text for token in ["ajuste", "correccion", "corrección"]):
+        if any(token in text for token in ["salida", "resta", "negativo", "disminucion", "disminución"]):
+            return -1
+        if any(token in text for token in ["entrada", "suma", "positivo", "aumento"]):
+            return 1
+
+    # Último respaldo con las constantes históricas exactas.
+    if clean_str(value) in TIPOS_POSITIVOS:
+        return 1
+    if clean_str(value) in TIPOS_NEGATIVOS:
+        return -1
+    return 0
+
+
+def stock_empty_frame() -> pd.DataFrame:
+    return pd.DataFrame(columns=[
+        "producto_id", "producto", "marca", "lote", "fecha_vencimiento", "unidad",
+        "ingreso_total", "salida_total", "stock_actual", "costo_total_ingresos",
+        "stock_minimo", "dias_alerta_vencimiento", "dias_para_vencer", "estado"
+    ])
+
+
 def calcular_stock(df_mov: pd.DataFrame, df_prod: pd.DataFrame) -> pd.DataFrame:
     df = ensure_columns(df_mov, "Movimientos")
     if df.empty:
-        return pd.DataFrame(columns=[
-            "producto_id", "producto", "marca", "lote", "fecha_vencimiento", "unidad",
-            "ingreso_total", "salida_total", "stock_actual", "costo_total_ingresos",
-            "stock_minimo", "dias_alerta_vencimiento", "dias_para_vencer", "estado"
-        ])
+        return stock_empty_frame()
 
     df = df.copy()
     df["cantidad_num"] = to_number(df["cantidad"])
     df["costo_total_num"] = to_number(df["costo_total"])
     df["tipo_movimiento"] = df["tipo_movimiento"].astype(str).str.strip()
-    df["entrada"] = np.where(df["tipo_movimiento"].isin(TIPOS_POSITIVOS), df["cantidad_num"], 0)
-    df["salida"] = np.where(df["tipo_movimiento"].isin(TIPOS_NEGATIVOS), df["cantidad_num"], 0)
-    df["costo_ingreso"] = np.where(df["tipo_movimiento"].isin(TIPOS_POSITIVOS), df["costo_total_num"], 0)
+    df["mov_sign"] = df["tipo_movimiento"].apply(movimiento_sign)
+    df["entrada"] = np.where(df["mov_sign"] > 0, df["cantidad_num"], 0)
+    df["salida"] = np.where(df["mov_sign"] < 0, df["cantidad_num"], 0)
+    df["costo_ingreso"] = np.where(df["mov_sign"] > 0, df["costo_total_num"], 0)
 
     group_cols = ["producto_id", "producto", "marca", "lote", "fecha_vencimiento", "unidad"]
     stock = (
@@ -1105,6 +1160,101 @@ def calcular_stock(df_mov: pd.DataFrame, df_prod: pd.DataFrame) -> pd.DataFrame:
     stock["estado"] = stock.apply(estado, axis=1)
     stock = stock.sort_values(["estado", "producto", "fecha_vencimiento", "lote"], na_position="last")
     return stock
+
+
+@st.cache_data(ttl=20, show_spinner="Verificando stock directamente en Google Sheets...")
+def load_operational_data_cached(_storage, refresh_token: int) -> Dict[str, pd.DataFrame]:
+    """Carga hojas operativas con caché corta para tomar lo que existe en Google Sheets.
+
+    Esta lectura se usa especialmente en Movimientos/Salidas para que el carrito
+    calcule el stock con la base real y no únicamente con datos que pudieron quedar
+    cacheados al iniciar la app.
+    """
+    sheets = ["Productos", "Proveedores", "Solicitantes", "Personal", "Movimientos"]
+    if hasattr(_storage, "load_many"):
+        loaded = _storage.load_many(sheets)
+    else:
+        loaded = {sheet: _storage.load(sheet) for sheet in sheets}
+
+    # Kardex_Consolidado es diagnóstico; si no existe no debe romper la operación.
+    try:
+        loaded["Kardex_Consolidado"] = _storage.load("Kardex_Consolidado")
+    except Exception:
+        loaded["Kardex_Consolidado"] = pd.DataFrame(columns=SHEET_COLUMNS["Kardex_Consolidado"])
+    return loaded
+
+
+def calcular_stock_desde_kardex_consolidado(df_kardex: pd.DataFrame, df_prod: pd.DataFrame) -> pd.DataFrame:
+    """Convierte la hoja física Kardex_Consolidado a formato de stock para diagnóstico.
+
+    No reemplaza la fuente oficial de transacciones. La fuente oficial sigue siendo
+    Movimientos; esta conversión permite detectar si existe una hoja consolidada con
+    saldos que no están respaldados por movimientos válidos.
+    """
+    kd = ensure_columns(df_kardex, "Kardex_Consolidado")
+    if kd.empty:
+        return stock_empty_frame()
+    out = pd.DataFrame({
+        "producto_id": kd["producto_id"],
+        "producto": kd["producto"],
+        "marca": kd["marca"],
+        "lote": kd["lote"],
+        "fecha_vencimiento": kd["fecha_vencimiento"],
+        "unidad": kd["unidad"],
+        "ingreso_total": to_number(kd["entrada_total"]),
+        "salida_total": to_number(kd["salida_total"]),
+        "stock_actual": to_number(kd["saldo_actual"]),
+        "costo_total_ingresos": 0,
+    })
+    prod = ensure_columns(df_prod, "Productos")[["producto_id", "stock_minimo", "dias_alerta_vencimiento"]].copy()
+    prod["stock_minimo"] = to_number(prod["stock_minimo"])
+    prod["dias_alerta_vencimiento"] = to_number(prod["dias_alerta_vencimiento"], 90)
+    out = out.merge(prod, on="producto_id", how="left")
+    out["stock_minimo"] = to_number(out["stock_minimo"])
+    out["dias_alerta_vencimiento"] = to_number(out["dias_alerta_vencimiento"], 90)
+    venc = to_date(out["fecha_vencimiento"])
+    out["dias_para_vencer"] = (venc - TODAY).dt.days
+    def estado(row) -> str:
+        stock_actual = float(row.get("stock_actual", 0) or 0)
+        dias = row.get("dias_para_vencer")
+        minimo = float(row.get("stock_minimo", 0) or 0)
+        alerta = float(row.get("dias_alerta_vencimiento", 90) or 90)
+        if stock_actual <= 0:
+            return "Sin stock"
+        if pd.notna(dias) and dias < 0:
+            return "Vencido"
+        if pd.notna(dias) and dias <= alerta:
+            return "Por vencer"
+        if stock_actual <= minimo:
+            return "Stock bajo"
+        return "Disponible"
+    out["estado"] = out.apply(estado, axis=1)
+    return out.sort_values(["estado", "producto", "fecha_vencimiento", "lote"], na_position="last")
+
+
+def refresh_operational_data_and_stock(storage, data: Dict[str, pd.DataFrame], current_stock: pd.DataFrame) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame, pd.DataFrame]:
+    """Refresca Movimientos y catálogos desde la base real para salidas/correcciones.
+
+    Devuelve:
+    - data actualizado
+    - stock calculado desde Movimientos, que es la fuente oficial
+    - stock calculado desde Kardex_Consolidado solo para diagnóstico
+    """
+    try:
+        refresh_token = st.session_state.get("data_refresh_token", 0)
+        live = load_operational_data_cached(storage, refresh_token)
+        for sheet, df in live.items():
+            if sheet in SHEET_COLUMNS:
+                data[sheet] = ensure_columns(df, sheet)
+        stock_mov = calcular_stock(data.get("Movimientos", pd.DataFrame()), data.get("Productos", pd.DataFrame()))
+        stock_kardex = calcular_stock_desde_kardex_consolidado(data.get("Kardex_Consolidado", pd.DataFrame()), data.get("Productos", pd.DataFrame()))
+        return data, stock_mov, stock_kardex
+    except Exception as exc:
+        st.warning(
+            "No se pudo refrescar la información operativa directamente desde la base. "
+            "Se usará la información ya cargada en memoria. Detalle: " + exception_detail(exc)
+        )
+        return data, current_stock, stock_empty_frame()
 
 
 def kardex_consolidado_columns() -> List[str]:
@@ -2037,6 +2187,11 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
         "Ingreso, salida por carrito, devolución desde salidas históricas y correcciones de inventario con formularios guiados."
     )
 
+    # V20: antes de registrar salidas/correcciones se verifica la base real.
+    # En Google Sheets se hace una lectura por lote con caché corta para evitar cuota,
+    # pero evitando que el carrito use datos viejos de una carga inicial.
+    data, stock, stock_kardex_sheet = refresh_operational_data_and_stock(storage, data, stock)
+
     productos = ensure_columns(data["Productos"], "Productos")
     proveedores = ensure_columns(data["Proveedores"], "Proveedores")
     solicitantes = ensure_columns(data["Solicitantes"], "Solicitantes")
@@ -2047,6 +2202,9 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
     proveedores = proveedores[active_mask(proveedores)].copy()
     solicitantes = solicitantes[active_mask(solicitantes)].copy()
     personal_df = personal_df[active_mask(personal_df)].copy()
+
+    if storage.__class__.__name__ == "GoogleSheetsStorage":
+        st.caption("Stock operativo verificado contra Google Sheets: hoja Movimientos + catálogo Productos. La hoja Kardex_Consolidado se usa como respaldo visual/diagnóstico, no como fuente transaccional principal.")
 
     if productos.empty:
         st.warning("Primero registre al menos un producto en el catálogo. El formulario tomará de ahí la marca, unidad, categoría, stock mínimo y días de alerta.")
@@ -2208,9 +2366,12 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             productos_count = len(productos)
             movimientos_count = len(movimientos)
             tipos_mov = movimientos["tipo_movimiento"].astype(str).str.strip() if not movimientos.empty else pd.Series(dtype=str)
-            ingresos_count = int(tipos_mov.isin(TIPOS_POSITIVOS).sum()) if not movimientos.empty else 0
-            salidas_count = int(tipos_mov.isin(TIPOS_NEGATIVOS).sum()) if not movimientos.empty else 0
+            signos_mov = tipos_mov.apply(movimiento_sign) if not movimientos.empty else pd.Series(dtype=int)
+            ingresos_count = int((signos_mov > 0).sum()) if not movimientos.empty else 0
+            salidas_count = int((signos_mov < 0).sum()) if not movimientos.empty else 0
             stock_rows = len(stock) if not stock.empty else 0
+            kardex_sheet_rows = len(stock_kardex_sheet) if 'stock_kardex_sheet' in locals() and not stock_kardex_sheet.empty else 0
+            kardex_sheet_positive = int((to_number(stock_kardex_sheet["stock_actual"]) > 0).sum()) if 'stock_kardex_sheet' in locals() and not stock_kardex_sheet.empty else 0
 
             st.error("No hay lotes con stock disponible para registrar salidas.")
             st.warning(
@@ -2223,7 +2384,9 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
                 {"Validación": "Movimientos que suman stock", "Cantidad": ingresos_count, "Interpretación": "Ingreso, Devolución o Corrección entrada."},
                 {"Validación": "Movimientos que restan stock", "Cantidad": salidas_count, "Interpretación": "Salida o Corrección salida."},
                 {"Validación": "Lotes calculados en stock", "Cantidad": stock_rows, "Interpretación": "Filas generadas desde movimientos por producto/lote."},
-                {"Validación": "Lotes con saldo > 0", "Cantidad": 0, "Interpretación": "Por eso no aparece el carrito de salida."},
+                {"Validación": "Lotes con saldo > 0 desde Movimientos", "Cantidad": 0, "Interpretación": "Por eso no aparece el carrito de salida."},
+                {"Validación": "Filas en hoja Kardex_Consolidado", "Cantidad": kardex_sheet_rows, "Interpretación": "Hoja calculada/visual en Google Sheets."},
+                {"Validación": "Saldos > 0 en Kardex_Consolidado", "Cantidad": kardex_sheet_positive, "Interpretación": "Si aquí hay saldos pero no en Movimientos, debe reconstruirse la hoja desde Movimientos o revisar tipos/cantidades."},
             ])
             st.dataframe(diag_df, use_container_width=True, hide_index=True)
 
@@ -2238,7 +2401,14 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
                 )
             elif stock_rows > 0:
                 st.info(
-                    "El sistema sí calculó lotes, pero todos tienen saldo cero o negativo. Revise el Kardex consolidado para confirmar consumo total."
+                    "El sistema sí calculó lotes desde Movimientos, pero todos tienen saldo cero o negativo. Revise el Kardex consolidado para confirmar consumo total."
+                )
+
+            if kardex_sheet_positive > 0 and ingresos_count == 0:
+                st.warning(
+                    "Se detectan saldos positivos en la hoja física Kardex_Consolidado, pero no hay ingresos válidos en Movimientos. "
+                    "Para hacer salidas seguras, el sistema necesita movimientos de ingreso/devolución/corrección entrada, porque Movimientos es la bitácora oficial. "
+                    "Revise que los tipos de movimiento estén escritos como Ingreso, Entrada, Devolución o Corrección entrada y que cantidad sea numérica."
                 )
 
             if st.button("🔄 Actualizar datos desde Google Sheets", use_container_width=True):
@@ -2493,13 +2663,28 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
         return
     if tipo == "Corrección salida":
         disponibles = disponibles[disponibles["stock_actual"] > 0].copy()
+        if disponibles.empty:
+            st.error("No hay lotes con stock mayor a cero para registrar una Corrección salida.")
+            st.info("El sistema verificó la base y encontró lotes, pero ninguno tiene saldo disponible para restar. Revise ingresos, salidas y cantidades en Movimientos.")
+            st.markdown("</div>", unsafe_allow_html=True)
+            return
     disponibles = disponibles.sort_values(["producto", "fecha_vencimiento", "lote"], na_position="last").reset_index(drop=True)
     disponibles["label"] = disponibles.apply(
         lambda r: f"{r['producto']} | Marca: {r['marca']} | Lote: {r['lote']} | Vence: {r['fecha_vencimiento']} | Stock: {float(r['stock_actual']):,.0f} {r['unidad']}",
         axis=1,
     )
-    label = st.selectbox("Producto/lote a corregir", disponibles["label"].tolist())
-    selected = disponibles[disponibles["label"] == label].iloc[0]
+    labels_disponibles = disponibles["label"].dropna().astype(str).tolist()
+    if not labels_disponibles:
+        st.error("No hay productos/lotes válidos para seleccionar en la corrección.")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+    label = st.selectbox("Producto/lote a corregir", labels_disponibles)
+    selected_match = disponibles[disponibles["label"].astype(str) == str(label)]
+    if selected_match.empty:
+        st.warning("La selección ya no está disponible. Actualice datos desde Google Sheets e intente nuevamente.")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+    selected = selected_match.iloc[0]
     prod_row = _catalog_row_by_id(clean_str(selected["producto_id"]))
     if clean_str(prod_row.get("nombre_producto", "")) == "":
         prod_row["nombre_producto"] = selected["producto"]
