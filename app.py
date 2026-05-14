@@ -2205,7 +2205,45 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
         st.markdown("#### 1) Armar carrito de salida")
         disponibles = stock[stock["stock_actual"] > 0].copy() if not stock.empty else pd.DataFrame()
         if disponibles.empty:
+            productos_count = len(productos)
+            movimientos_count = len(movimientos)
+            tipos_mov = movimientos["tipo_movimiento"].astype(str).str.strip() if not movimientos.empty else pd.Series(dtype=str)
+            ingresos_count = int(tipos_mov.isin(TIPOS_POSITIVOS).sum()) if not movimientos.empty else 0
+            salidas_count = int(tipos_mov.isin(TIPOS_NEGATIVOS).sum()) if not movimientos.empty else 0
+            stock_rows = len(stock) if not stock.empty else 0
+
             st.error("No hay lotes con stock disponible para registrar salidas.")
+            st.warning(
+                "Tener productos registrados en el catálogo no significa que exista stock disponible. "
+                "La salida solo se habilita cuando el sistema encuentra movimientos de ingreso, devolución o corrección de entrada con saldo mayor a cero."
+            )
+            diag_df = pd.DataFrame([
+                {"Validación": "Productos en catálogo", "Cantidad": productos_count, "Interpretación": "Son datos maestros; no generan existencia por sí solos."},
+                {"Validación": "Movimientos registrados", "Cantidad": movimientos_count, "Interpretación": "Bitácora transaccional usada para calcular stock."},
+                {"Validación": "Movimientos que suman stock", "Cantidad": ingresos_count, "Interpretación": "Ingreso, Devolución o Corrección entrada."},
+                {"Validación": "Movimientos que restan stock", "Cantidad": salidas_count, "Interpretación": "Salida o Corrección salida."},
+                {"Validación": "Lotes calculados en stock", "Cantidad": stock_rows, "Interpretación": "Filas generadas desde movimientos por producto/lote."},
+                {"Validación": "Lotes con saldo > 0", "Cantidad": 0, "Interpretación": "Por eso no aparece el carrito de salida."},
+            ])
+            st.dataframe(diag_df, use_container_width=True, hide_index=True)
+
+            if productos_count > 0 and ingresos_count == 0:
+                st.info(
+                    "Siguiente paso recomendado: registre primero un movimiento de tipo Ingreso para el producto/lote. "
+                    "Después de guardar el ingreso, el lote aparecerá automáticamente en Salida."
+                )
+            elif ingresos_count > 0 and stock_rows == 0:
+                st.info(
+                    "Hay ingresos registrados, pero no se logró construir stock. Revise que los movimientos tengan producto, lote, unidad, cantidad y tipo_movimiento correctos."
+                )
+            elif stock_rows > 0:
+                st.info(
+                    "El sistema sí calculó lotes, pero todos tienen saldo cero o negativo. Revise el Kardex consolidado para confirmar consumo total."
+                )
+
+            if st.button("🔄 Actualizar datos desde Google Sheets", use_container_width=True):
+                mark_data_dirty()
+                rerun()
             st.markdown("</div>", unsafe_allow_html=True)
             return
 

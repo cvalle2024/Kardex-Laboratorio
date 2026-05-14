@@ -298,3 +298,7 @@ Para el acta PDF, asegúrese de que `requirements.txt` incluya:
 ```text
 reportlab>=4.2.0
 ```
+
+## Nota V19 — Salidas y stock disponible
+
+El módulo de salidas solo muestra productos con saldo disponible calculado desde la hoja Movimientos. Los productos registrados en el catálogo no aparecen en salida hasta que se registre un movimiento de Ingreso, Devolución o Corrección entrada. Si no hay lotes disponibles, el sistema muestra una tabla de diagnóstico para orientar al usuario.
