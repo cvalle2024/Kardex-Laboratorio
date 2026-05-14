@@ -7,6 +7,7 @@ import string
 import time
 import uuid
 from io import BytesIO
+import base64
 from pathlib import Path
 from typing import Dict, List, Tuple
 from urllib.parse import quote
@@ -34,7 +35,7 @@ SESSION_TIMEOUT_MINUTES = 15
 
 KARDEX_CONSOLIDADO_COLUMNS: List[str] = [
     "estado", "producto_id", "producto", "marca", "lote", "unidad",
-    "fecha_ingreso", "proveedor_ingreso", "fecha_elaboracion", "fecha_vencimiento",
+    "fecha_ingreso", "proveedor_ingreso", "orden_compra_ingreso", "fecha_elaboracion", "fecha_vencimiento",
     "entrada_total", "salida_total", "saldo_actual", "porcentaje_consumido",
     "numero_salidas", "fecha_ultima_salida", "ultimo_entregado_a", "ultimo_personal_entrega",
     "detalle_salidas", "observacion_ingreso", "dias_para_vencer", "stock_minimo",
@@ -61,8 +62,8 @@ SHEET_COLUMNS: Dict[str, List[str]] = {
     ],
     "Movimientos": [
         "movimiento_id", "fecha", "tipo_movimiento", "producto_id", "producto", "marca", "lote",
-        "proveedor", "solicitante", "personal", "fecha_elaboracion", "fecha_vencimiento",
-        "unidad", "cantidad", "costo_total", "observacion", "usuario_registro", "fecha_registro"
+        "proveedor", "orden_compra", "solicitante", "personal", "fecha_elaboracion", "fecha_vencimiento",
+        "unidad", "cantidad", "costo_total", "observacion", "usuario_registro", "fecha_registro", "acta_entrega_id"
     ],
     # Hoja física en Google Sheets/Excel. Se calcula automáticamente desde Movimientos.
     # Esta hoja permite ver el stock actual en la misma base, sin depender solo de la vista de Streamlit.
@@ -89,9 +90,10 @@ TABLE_BORDER_COLOR = {"red": 0.82, "green": 0.86, "blue": 0.90}
 TABLE_BODY_COLOR = {"red": 1, "green": 1, "blue": 1}
 TABLE_ALT_COLOR = {"red": 0.965, "green": 0.976, "blue": 0.988}
 
-TIPOS_MOVIMIENTO = ["Ingreso", "Salida", "Devolución", "Ajuste entrada", "Ajuste salida"]
-TIPOS_POSITIVOS = {"Ingreso", "Devolución", "Ajuste entrada"}
-TIPOS_NEGATIVOS = {"Salida", "Ajuste salida"}
+TIPOS_MOVIMIENTO = ["Ingreso", "Salida", "Devolución", "Corrección entrada", "Corrección salida"]
+# Se mantienen los valores legacy Ajuste entrada/salida para no romper bases creadas con versiones anteriores.
+TIPOS_POSITIVOS = {"Ingreso", "Devolución", "Corrección entrada", "Ajuste entrada"}
+TIPOS_NEGATIVOS = {"Salida", "Corrección salida", "Ajuste salida"}
 CATEGORIAS_DEFAULT = ["Reactivo", "Insumo", "Equipo", "Material", "Papelería", "Otro"]
 UNIDADES_DEFAULT = [
     "TABLETAS", "FRASCOS", "RESMAS", "C/U", "SET", "ROLLOS", "PRUEBAS", "KIT",
@@ -541,8 +543,13 @@ class LocalExcelStorage:
         mark_data_dirty()
 
     def append_row(self, sheet: str, row: dict) -> None:
+        self.append_rows(sheet, [row])
+
+    def append_rows(self, sheet: str, rows: list[dict]) -> None:
+        if not rows:
+            return
         df = self.load(sheet)
-        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+        df = pd.concat([df, pd.DataFrame(rows)], ignore_index=True)
         self.save(sheet, df)
         mark_data_dirty()
 
@@ -949,21 +956,26 @@ class GoogleSheetsStorage:
             ) from exc
 
     def append_row(self, sheet: str, row: dict) -> None:
-        df = pd.DataFrame([row])
+        return self.append_rows(sheet, [row])
+
+    def append_rows(self, sheet: str, rows: list[dict]) -> dict:
+        if not rows:
+            return {}
+        df = pd.DataFrame(rows)
         df = normalize_for_sheet(ensure_columns(df, sheet))
-        values = df.iloc[0].tolist()
+        values = df.values.tolist()
         append_range = quote(f"'{sheet}'!A1", safe="")
         url = f"{self.base_url}/values/{append_range}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS&includeValuesInResponse=false"
         try:
             self._create_sheet_and_header(sheet)
-            response = self._request("post", url, json={"values": [values]})
-            # Se actualiza el formato de la pestaña para que el nuevo registro quede dentro del filtro y la tabla visual.
+            response = self._request("post", url, json={"values": values})
+            # Se actualiza el formato de la pestaña para que los nuevos registros queden dentro del filtro y la tabla visual.
             self.apply_table_format(sheet, data_rows=0, strict=False)
             mark_data_dirty()
             return response
         except Exception as exc:
             raise RuntimeError(
-                f"No se pudo agregar fila en '{sheet}'. Detalle API: {exception_detail(exc)}. "
+                f"No se pudieron agregar filas en '{sheet}'. Detalle API: {exception_detail(exc)}. "
                 f"Revisión: {diagnose_gsheets_error(exc)}"
             ) from exc
 
@@ -1159,13 +1171,14 @@ def calcular_kardex_consolidado(df_mov: pd.DataFrame, df_prod: pd.DataFrame) -> 
             .agg(
                 fecha_ingreso=("fecha", first_non_empty),
                 proveedor_ingreso=("proveedor", first_non_empty),
+                orden_compra_ingreso=("orden_compra", first_non_empty),
                 fecha_elaboracion=("fecha_elaboracion", first_non_empty),
                 observacion_ingreso=("observacion", first_non_empty),
             )
             .reset_index()
         )
     else:
-        ingreso_info = pd.DataFrame(columns=group_cols + ["fecha_ingreso", "proveedor_ingreso", "fecha_elaboracion", "observacion_ingreso"])
+        ingreso_info = pd.DataFrame(columns=group_cols + ["fecha_ingreso", "proveedor_ingreso", "orden_compra_ingreso", "fecha_elaboracion", "observacion_ingreso"])
 
     negativos = df[df["tipo_movimiento"].isin(TIPOS_NEGATIVOS)].copy()
     if not negativos.empty:
@@ -1235,7 +1248,7 @@ def calcular_kardex_consolidado(df_mov: pd.DataFrame, df_prod: pd.DataFrame) -> 
         return "Disponible sin salidas"
 
     kardex["estado"] = kardex.apply(estado_consolidado, axis=1)
-    for col in ["fecha_ingreso", "proveedor_ingreso", "fecha_elaboracion", "observacion_ingreso", "fecha_ultima_salida", "ultimo_entregado_a", "ultimo_personal_entrega", "detalle_salidas"]:
+    for col in ["fecha_ingreso", "proveedor_ingreso", "orden_compra_ingreso", "fecha_elaboracion", "observacion_ingreso", "fecha_ultima_salida", "ultimo_entregado_a", "ultimo_personal_entrega", "detalle_salidas"]:
         if col not in kardex.columns:
             kardex[col] = ""
         kardex[col] = kardex[col].fillna("")
@@ -1842,16 +1855,193 @@ def page_dashboard(data: Dict[str, pd.DataFrame], stock: pd.DataFrame) -> None:
         st.dataframe(alertas[["estado", "producto", "marca", "lote", "fecha_vencimiento", "dias_para_vencer", "stock_actual", "stock_minimo", "unidad"]], use_container_width=True, hide_index=True)
 
 
+# ============================================================
+# MÓDULO OPERATIVO DE MOVIMIENTOS V18
+# ============================================================
+def spanish_month_name(month: int) -> str:
+    meses = {
+        1: "enero", 2: "febrero", 3: "marzo", 4: "abril", 5: "mayo", 6: "junio",
+        7: "julio", 8: "agosto", 9: "septiembre", 10: "octubre", 11: "noviembre", 12: "diciembre"
+    }
+    return meses.get(int(month), "")
+
+
+def fecha_larga_es(value) -> str:
+    dt = pd.to_datetime(value, errors="coerce")
+    if pd.isna(dt):
+        dt = TODAY
+    return f"{dt.day} de {spanish_month_name(dt.month)} de {dt.year}"
+
+
+def next_movement_ids(df: pd.DataFrame, n: int) -> list[str]:
+    first = next_code("MOV", df, "movimiento_id", 6)
+    try:
+        base = int(str(first).split("-")[-1])
+    except Exception:
+        base = int(time.time()) % 900000
+    return [f"MOV-{base + i:06d}" for i in range(n)]
+
+
+def get_first_match(df: pd.DataFrame, col: str, value: str) -> dict:
+    if df is None or df.empty or col not in df.columns:
+        return {}
+    m = df[df[col].astype(str) == str(value)]
+    if m.empty:
+        return {}
+    return {k: clean_str(v) for k, v in m.iloc[0].to_dict().items()}
+
+
+def build_acta_entrega_pdf(
+    salida_rows: list[dict],
+    solicitante_info: dict,
+    personal_info: dict,
+    fecha_entrega,
+    recibe_nombre: str = "",
+    recibe_cargo: str = "",
+    ciudad: str = "Tegucigalpa",
+    observacion: str = "",
+) -> bytes:
+    """Genera acta de entrega en PDF basada en el diseño del acta de referencia.
+
+    La salida se agrupa en una sola acta por sitio/solicitante y lista todos los
+    productos del carrito de salida. Cada producto ya queda registrado de forma
+    individual en la hoja Movimientos.
+    """
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import inch
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    except Exception as exc:
+        raise RuntimeError("Falta instalar reportlab. Agregue reportlab en requirements.txt.") from exc
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=letter,
+        rightMargin=0.85 * inch,
+        leftMargin=0.85 * inch,
+        topMargin=0.58 * inch,
+        bottomMargin=0.60 * inch,
+    )
+    styles = getSampleStyleSheet()
+    normal = ParagraphStyle("ActaNormal", parent=styles["Normal"], fontName="Helvetica", fontSize=10.5, leading=14, alignment=TA_LEFT)
+    normal_center = ParagraphStyle("ActaCenter", parent=normal, alignment=TA_CENTER)
+    normal_right = ParagraphStyle("ActaRight", parent=normal, alignment=TA_RIGHT)
+    bold = ParagraphStyle("ActaBold", parent=normal, fontName="Helvetica-Bold")
+    small = ParagraphStyle("ActaSmall", parent=normal, fontSize=8.7, leading=11)
+    small_center = ParagraphStyle("ActaSmallCenter", parent=small, alignment=TA_CENTER)
+    note_style = ParagraphStyle("ActaNote", parent=normal, fontSize=8.8, leading=12, italic=True)
+
+    sitio = clean_str(solicitante_info.get("unidad_solicitante", "")) or clean_str(salida_rows[0].get("solicitante", "")) or "Sitio receptor"
+    responsable_catalogo = clean_str(solicitante_info.get("responsable", ""))
+    recibe_nombre = clean_str(recibe_nombre) or responsable_catalogo or "Responsable del sitio"
+    recibe_cargo = clean_str(recibe_cargo) or "Responsable / receptor"
+    entrega_nombre = clean_str(personal_info.get("nombre", "")) or clean_str(salida_rows[0].get("personal", "")) or "Personal que entrega"
+    entrega_cargo = clean_str(personal_info.get("cargo", "")) or "Personal asignado"
+
+    story = []
+    # Logo simplificado en texto para evitar depender de archivos externos en Streamlit Cloud.
+    story.append(Paragraph("<b><font color='#0B4F8A' size='25'>VIHCA</font></b> <font color='#B91C1C' size='24'>♦</font>", normal_center))
+    story.append(Paragraph("<font color='#B91C1C' size='7'><b>PROGRAMA REGIONAL DE VIH</b></font>", normal_center))
+    story.append(Spacer(1, 0.18 * inch))
+    story.append(Paragraph(f"{ciudad} {fecha_larga_es(fecha_entrega)}", normal_right))
+    story.append(Spacer(1, 0.18 * inch))
+
+    story.append(Paragraph(f"<b>{recibe_nombre}</b>", bold))
+    story.append(Paragraph(sitio, normal))
+    story.append(Spacer(1, 0.20 * inch))
+
+    story.append(Paragraph(
+        "Reciba un cordial saludo de parte del Programa Regional Centroamericano de VIH Asociado al "
+        "Centro de Estudios en Salud de la Universidad del Valle de Guatemala.", normal
+    ))
+    story.append(Spacer(1, 0.12 * inch))
+    story.append(Paragraph(
+        f"El motivo de la presente es para hacer de su conocimiento que como parte del apoyo que el "
+        f"Programa de VIH brinda en Honduras, se hace entrega formal de los siguientes reactivos e insumos "
+        f"para el procesamiento y uso en {sitio}.", normal
+    ))
+    story.append(Spacer(1, 0.24 * inch))
+
+    data_table = [[
+        Paragraph("<b>DESCRIPCIÓN</b>", normal_center),
+        Paragraph("<b>PRESENTACIÓN / CANTIDAD</b>", normal_center),
+        Paragraph("<b>FECHA DE<br/>VENCIMIENTO</b>", normal_center),
+        Paragraph("<b>LOTE</b>", normal_center),
+    ]]
+    for r in salida_rows:
+        desc = clean_str(r.get("producto", ""))
+        marca = clean_str(r.get("marca", ""))
+        if marca:
+            desc = f"{desc}<br/><font size='8'>Marca: {marca}</font>"
+        cantidad = float(r.get("cantidad", 0) or 0)
+        cantidad_txt = f"{cantidad:,.0f}" if cantidad.is_integer() else f"{cantidad:,.2f}"
+        unidad = clean_str(r.get("unidad", ""))
+        data_table.append([
+            Paragraph(desc, normal_center),
+            Paragraph(f"{cantidad_txt} {unidad}", normal_center),
+            Paragraph(format_date(r.get("fecha_vencimiento", "")), normal_center),
+            Paragraph(clean_str(r.get("lote", "")), normal_center),
+        ])
+
+    table = Table(data_table, colWidths=[2.30 * inch, 1.85 * inch, 1.55 * inch, 1.15 * inch], hAlign="CENTER")
+    table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 1.1, colors.black),
+        ("BOX", (0, 0), (-1, -1), 1.6, colors.black),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story.append(table)
+    story.append(Spacer(1, 0.40 * inch))
+
+    firma_table = Table([
+        ["____________________________", "____________________________"],
+        [Paragraph("<b>Entregué conforme</b>", small_center), Paragraph("<b>Recibí conforme</b>", small_center)],
+        [Paragraph(f"<b>{entrega_nombre}</b>", small_center), Paragraph(f"<b>{recibe_nombre}</b>", small_center)],
+        [Paragraph(entrega_cargo, small_center), Paragraph(recibe_cargo, small_center)],
+        [Paragraph("Programa Regional Centroamericano de VIH<br/>Asociado al Centro de Estudios en Salud, de la<br/>Universidad del Valle de Guatemala", small_center), Paragraph(sitio, small_center)],
+    ], colWidths=[3.25 * inch, 3.25 * inch])
+    firma_table.setStyle(TableStyle([
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+    ]))
+    story.append(firma_table)
+    story.append(Spacer(1, 0.35 * inch))
+
+    note = (
+        "<b>Nota:</b> se hace constar que, para la validación de este proceso y la posterior gestión del retorno "
+        "del acta de entrega, es requisito indispensable que el documento cuente con la <b>firma y el sello oficial "
+        "del laboratorio receptor</b>, para fines de inventario y control de calidad. (favor entregarla al personal "
+        "de VIHCA asignado, después de su recepción y firma)"
+    )
+    if clean_str(observacion):
+        note += f"<br/><br/><b>Observación:</b> {clean_str(observacion)}"
+    story.append(Paragraph(note, note_style))
+
+    doc.build(story)
+    return buffer.getvalue()
+
+
 def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame) -> None:
     section_header(
-        "➕ Registrar movimiento",
-        "Formulario guiado: primero seleccione el producto/lote y luego complete cantidades, proveedor, solicitante y responsable."
+        "➕ Registrar movimientos",
+        "Ingreso, salida por carrito, devolución desde salidas históricas y correcciones de inventario con formularios guiados."
     )
 
     productos = ensure_columns(data["Productos"], "Productos")
     proveedores = ensure_columns(data["Proveedores"], "Proveedores")
     solicitantes = ensure_columns(data["Solicitantes"], "Solicitantes")
     personal_df = ensure_columns(data["Personal"], "Personal")
+    movimientos = ensure_columns(data["Movimientos"], "Movimientos")
 
     productos = productos[active_mask(productos)].copy()
     proveedores = proveedores[active_mask(proveedores)].copy()
@@ -1896,164 +2086,408 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             unsafe_allow_html=True,
         )
 
+    def _sync_after_save(rows: list[dict], message: str) -> None:
+        sync_data = dict(data)
+        sync_data["Movimientos"] = ensure_columns(
+            pd.concat([ensure_columns(data["Movimientos"], "Movimientos"), pd.DataFrame(rows)], ignore_index=True),
+            "Movimientos",
+        )
+        try:
+            sync_kardex_consolidado_sheet(storage, sync_data)
+            set_flash(message)
+        except Exception as exc:
+            set_flash(f"Registros guardados. No se pudo actualizar Kardex_Consolidado: {exc}", "warning")
+        bump_form_nonce("mov_form_nonce")
+        mark_data_dirty()
+        rerun()
+
     tipo = st.radio(
-        "Tipo de movimiento",
+        "Tipo de operación",
         TIPOS_MOVIMIENTO,
         horizontal=True,
-        help="Seleccione si está ingresando, entregando, recibiendo devolución o ajustando inventario."
+        help="Salida permite seleccionar varios insumos en un carrito. Devolución se basa en las salidas registradas. Ajuste ahora se llama Corrección."
     )
-    is_salida = tipo in TIPOS_NEGATIVOS
-
-    selected_stock_row = None
-    proveedor = ""
-    solicitante = ""
-    personal = ""
-    fecha_elaboracion = ""
-    costo_total = 0.0
 
     # ========================================================
-    # 1) Producto primero: aquí se toma la información del catálogo
+    # INGRESO
     # ========================================================
-    st.markdown("<div class='form-card'>", unsafe_allow_html=True)
-    st.markdown("#### 1) Producto / marca / lote")
+    if tipo == "Ingreso":
+        st.markdown("<div class='form-card'>", unsafe_allow_html=True)
+        st.markdown("#### 1) Producto / datos del catálogo")
+        productos_ord = productos.sort_values(["nombre_producto", "codigo_producto"], na_position="last")
+        labels = productos_ord.apply(
+            lambda r: f"{clean_str(r['nombre_producto'])} | Código: {clean_str(r['codigo_producto']) or 'Sin código'} | Marca: {clean_str(r['marca_default']) or 'Sin marca'}",
+            axis=1,
+        ).tolist()
+        producto_label = st.selectbox("Producto / reactivo / insumo registrado en catálogo", labels)
+        prod_row = productos_ord.iloc[labels.index(producto_label)]
+        producto_id = clean_str(prod_row["producto_id"])
+        producto = clean_str(prod_row["nombre_producto"])
+        marca_default = clean_str(prod_row.get("marca_default", ""))
+        unidad_default = clean_str(prod_row.get("unidad_default", ""))
+        _product_card(prod_row)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    if is_salida:
+        mov_nonce = int(st.session_state.get("mov_form_nonce", 0))
+        st.markdown("<div class='form-card'>", unsafe_allow_html=True)
+        with st.form(f"frm_ingreso_{mov_nonce}", clear_on_submit=True):
+            st.markdown("#### 2) Datos del ingreso")
+            c1, c2, c3 = st.columns(3)
+            fecha = c1.date_input("Fecha del ingreso", value=TODAY.date())
+            usuario = c2.text_input("Usuario que registra", value=st.session_state.get("nombre_usuario", "Usuario"))
+            cantidad = c3.number_input("Cantidad", min_value=0.0, step=1.0, format="%.2f")
+
+            st.markdown("#### 3) Datos del lote / presentación")
+            unidades = sorted(set([u for u in UNIDADES_DEFAULT + [unidad_default] if clean_str(u)]))
+            unidad_index = unidades.index(unidad_default) if unidad_default in unidades else 0
+            a, b, c = st.columns(3)
+            marca = a.text_input("Marca", value=marca_default, help="Se carga desde el catálogo del producto.")
+            lote = b.text_input("Lote *", placeholder="Ejemplo: AB-2026-001")
+            unidad = c.selectbox("Unidad", unidades, index=unidad_index)
+            d, e, f = st.columns(3)
+            fecha_elaboracion_dt = d.date_input("Fecha de elaboración", value=TODAY.date())
+            fecha_vencimiento_dt = e.date_input("Fecha de vencimiento", value=(TODAY + pd.Timedelta(days=365)).date())
+            costo_total = f.number_input("Costo total", min_value=0.0, step=1.0, format="%.2f")
+
+            st.markdown("#### 4) Proveedor / compra / responsable")
+            g, h, i = st.columns(3)
+            proveedor = g.selectbox("Proveedor *", [""] + proveedores["proveedor"].dropna().astype(str).sort_values().tolist())
+            orden_compra = h.text_input("Orden de compra", placeholder="Ejemplo: OC-2026-001")
+            personal = i.selectbox("Personal que recibe", [""] + personal_df["nombre"].dropna().astype(str).sort_values().tolist())
+            observacion = st.text_area("Observación", placeholder="Detalle de factura, donación, compra u otra referencia.")
+            submitted = st.form_submit_button("💾 Guardar ingreso", use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        if submitted:
+            if st.session_state.get("rol") == "Consulta":
+                st.error("El rol Consulta no puede registrar movimientos.")
+                return
+            if cantidad <= 0:
+                st.error("La cantidad debe ser mayor a cero.")
+                return
+            if not lote:
+                st.error("El lote es obligatorio.")
+                return
+            if not proveedor:
+                st.error("Para ingresos debe seleccionar proveedor.")
+                return
+            row = {
+                "movimiento_id": next_code("MOV", movimientos, "movimiento_id", 6),
+                "fecha": pd.to_datetime(fecha).strftime("%Y-%m-%d"),
+                "tipo_movimiento": "Ingreso",
+                "producto_id": producto_id,
+                "producto": producto,
+                "marca": marca,
+                "lote": lote,
+                "proveedor": proveedor,
+                "orden_compra": orden_compra,
+                "solicitante": "",
+                "personal": personal,
+                "fecha_elaboracion": fecha_elaboracion_dt.strftime("%Y-%m-%d"),
+                "fecha_vencimiento": fecha_vencimiento_dt.strftime("%Y-%m-%d"),
+                "unidad": unidad,
+                "cantidad": cantidad,
+                "costo_total": costo_total,
+                "observacion": observacion,
+                "usuario_registro": usuario,
+                "fecha_registro": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "acta_entrega_id": "",
+            }
+            storage.append_row("Movimientos", row)
+            _sync_after_save([row], "Ingreso guardado correctamente. El formulario quedó limpio y el Kardex consolidado fue actualizado.")
+        return
+
+    # ========================================================
+    # SALIDA CON CARRITO
+    # ========================================================
+    if tipo == "Salida":
+        st.markdown("<div class='form-card'>", unsafe_allow_html=True)
+        st.markdown("#### 1) Armar carrito de salida")
         disponibles = stock[stock["stock_actual"] > 0].copy() if not stock.empty else pd.DataFrame()
         if disponibles.empty:
             st.error("No hay lotes con stock disponible para registrar salidas.")
             st.markdown("</div>", unsafe_allow_html=True)
             return
 
-        disponibles = disponibles.sort_values(["producto", "fecha_vencimiento", "lote"], na_position="last")
-        cprod, clote = st.columns([1, 1.55])
-        filtro_producto = cprod.selectbox(
-            "Producto con existencia",
-            ["Todos"] + sorted(disponibles["producto"].dropna().astype(str).unique().tolist()),
-            help="Primero elija el producto. Luego seleccione el lote específico que entregará."
-        )
-        if filtro_producto != "Todos":
-            disponibles = disponibles[disponibles["producto"].astype(str) == filtro_producto]
+        if "salida_cart" not in st.session_state:
+            st.session_state["salida_cart"] = []
 
-        if disponibles.empty:
-            st.warning("No hay lotes disponibles para el producto seleccionado.")
-            st.markdown("</div>", unsafe_allow_html=True)
-            return
-
+        disponibles = disponibles.sort_values(["producto", "fecha_vencimiento", "lote"], na_position="last").reset_index(drop=True)
         disponibles["label"] = disponibles.apply(
             lambda r: f"{r['producto']} | Marca: {r['marca']} | Lote: {r['lote']} | Vence: {r['fecha_vencimiento']} | Stock: {float(r['stock_actual']):,.0f} {r['unidad']}",
             axis=1,
         )
-        label = clote.selectbox("Lote disponible para salida", disponibles["label"].tolist())
-        selected_stock_row = disponibles[disponibles["label"] == label].iloc[0]
 
-        producto_id = clean_str(selected_stock_row["producto_id"])
-        producto = clean_str(selected_stock_row["producto"])
-        marca = clean_str(selected_stock_row["marca"])
-        lote = clean_str(selected_stock_row["lote"])
-        fecha_vencimiento = format_date(selected_stock_row["fecha_vencimiento"])
-        unidad = clean_str(selected_stock_row["unidad"])
-        stock_disponible = float(selected_stock_row["stock_actual"])
-        prod_row = _catalog_row_by_id(producto_id)
-        if clean_str(prod_row.get("nombre_producto", "")) == "":
-            prod_row["nombre_producto"] = producto
-            prod_row["marca_default"] = marca
-            prod_row["unidad_default"] = unidad
-        _product_card(prod_row, "Ficha del producto seleccionado")
-        st.info(f"Stock disponible para este lote: {stock_disponible:,.0f} {unidad}. El sistema no permitirá registrar una salida mayor a este saldo.")
+        with st.form("frm_add_cart_salida", clear_on_submit=True):
+            cprod, clote, ccant = st.columns([1, 1.9, .8])
+            filtro_producto = cprod.selectbox("Producto", ["Todos"] + sorted(disponibles["producto"].dropna().astype(str).unique().tolist()))
+            lotes_view = disponibles.copy()
+            if filtro_producto != "Todos":
+                lotes_view = lotes_view[lotes_view["producto"].astype(str) == filtro_producto]
+            label = clote.selectbox("Lote disponible", lotes_view["label"].tolist())
+            selected_stock_row = lotes_view[lotes_view["label"] == label].iloc[0]
+            cantidad_item = ccant.number_input("Cantidad", min_value=0.0, step=1.0, format="%.2f")
+            add_item = st.form_submit_button("➕ Agregar al carrito", use_container_width=True)
 
-    else:
-        productos = productos.sort_values(["nombre_producto", "codigo_producto"], na_position="last")
-        labels = productos.apply(
-            lambda r: f"{clean_str(r['nombre_producto'])} | Código: {clean_str(r['codigo_producto']) or 'Sin código'} | Marca: {clean_str(r['marca_default']) or 'Sin marca'}",
-            axis=1,
-        ).tolist()
-        producto_label = st.selectbox(
-            "Producto / reactivo / insumo registrado en catálogo",
-            labels,
-            help="Al seleccionar el producto, el sistema toma automáticamente marca, unidad, categoría, stock mínimo y días de alerta registrados en el catálogo."
-        )
-        prod_row = productos.iloc[labels.index(producto_label)]
-        producto_id = clean_str(prod_row["producto_id"])
-        producto = clean_str(prod_row["nombre_producto"])
-        marca_default = clean_str(prod_row.get("marca_default", ""))
-        unidad_default = clean_str(prod_row.get("unidad_default", ""))
-        _product_card(prod_row)
-        st.caption("La marca y la unidad se cargan desde el catálogo. Puede modificarlas solo si este lote específico viene con una presentación diferente.")
+        if add_item:
+            if cantidad_item <= 0:
+                st.error("Ingrese una cantidad mayor a cero.")
+            else:
+                item_key = "|".join([
+                    clean_str(selected_stock_row.get("producto_id", "")), clean_str(selected_stock_row.get("lote", "")),
+                    clean_str(selected_stock_row.get("marca", "")), clean_str(selected_stock_row.get("fecha_vencimiento", "")),
+                ])
+                ya_en_carrito = sum(float(x.get("cantidad", 0) or 0) for x in st.session_state["salida_cart"] if x.get("item_key") == item_key)
+                disponible = float(selected_stock_row.get("stock_actual", 0) or 0)
+                if ya_en_carrito + cantidad_item > disponible:
+                    st.error(f"No puede agregar {cantidad_item:,.0f}; ya tiene {ya_en_carrito:,.0f} en el carrito y el stock disponible es {disponible:,.0f}.")
+                else:
+                    st.session_state["salida_cart"].append({
+                        "item_key": item_key,
+                        "producto_id": clean_str(selected_stock_row["producto_id"]),
+                        "producto": clean_str(selected_stock_row["producto"]),
+                        "marca": clean_str(selected_stock_row["marca"]),
+                        "lote": clean_str(selected_stock_row["lote"]),
+                        "fecha_vencimiento": format_date(selected_stock_row["fecha_vencimiento"]),
+                        "unidad": clean_str(selected_stock_row["unidad"]),
+                        "cantidad": cantidad_item,
+                        "stock_disponible": disponible,
+                    })
+                    st.success("Producto agregado al carrito.")
+                    rerun()
 
-    st.markdown("</div>", unsafe_allow_html=True)
+        cart = st.session_state.get("salida_cart", [])
+        if cart:
+            st.markdown("#### 2) Productos seleccionados para la salida")
+            cart_df = pd.DataFrame(cart).drop(columns=["item_key"], errors="ignore")
+            cart_df.insert(0, "item_no", range(1, len(cart_df) + 1))
+            st.dataframe(cart_df, use_container_width=True, hide_index=True)
+            r1, r2 = st.columns([1, 2])
+            quitar = r1.selectbox("Quitar item", [""] + [str(i) for i in range(1, len(cart) + 1)])
+            if r2.button("🗑️ Quitar del carrito", use_container_width=True, disabled=(not quitar)):
+                idx = int(quitar) - 1
+                st.session_state["salida_cart"].pop(idx)
+                rerun()
+        else:
+            st.info("Agregue uno o varios productos al carrito. Al guardar la salida, cada producto se registrará como una fila individual en Movimientos.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        if st.session_state.get("last_acta_pdf"):
+            st.download_button(
+                "📄 Descargar última acta de entrega generada",
+                data=st.session_state["last_acta_pdf"],
+                file_name=st.session_state.get("last_acta_filename", "acta_entrega.pdf"),
+                mime="application/pdf",
+                use_container_width=True,
+            )
+
+        mov_nonce = int(st.session_state.get("mov_form_nonce", 0))
+        st.markdown("<div class='form-card'>", unsafe_allow_html=True)
+        with st.form(f"frm_confirmar_salida_{mov_nonce}", clear_on_submit=True):
+            st.markdown("#### 3) Datos de entrega / sitio receptor")
+            a, b, c = st.columns(3)
+            fecha = a.date_input("Fecha de salida", value=TODAY.date())
+            usuario = b.text_input("Usuario que registra", value=st.session_state.get("nombre_usuario", "Usuario"))
+            solicitante = c.selectbox("Sitio / unidad solicitante *", [""] + solicitantes["unidad_solicitante"].dropna().astype(str).sort_values().tolist())
+            solicitante_info = get_first_match(solicitantes, "unidad_solicitante", solicitante)
+            d, e, f = st.columns(3)
+            personal = d.selectbox("Personal que entrega *", [""] + personal_df["nombre"].dropna().astype(str).sort_values().tolist())
+            recibe_default = clean_str(solicitante_info.get("responsable", "")) if solicitante_info else ""
+            recibe_nombre = e.text_input("Persona que recibe / firma", value=recibe_default)
+            recibe_cargo = f.text_input("Cargo de quien recibe", value="Responsable del sitio")
+            observacion = st.text_area("Observación para movimientos y acta", placeholder="Detalle de solicitud, referencia o comentario de entrega.")
+            generar_acta = st.checkbox("Generar acta de entrega en PDF", value=True)
+            submitted = st.form_submit_button("💾 Guardar salida y generar acta", use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        if submitted:
+            if st.session_state.get("rol") == "Consulta":
+                st.error("El rol Consulta no puede registrar movimientos.")
+                return
+            cart = st.session_state.get("salida_cart", [])
+            if not cart:
+                st.error("Debe agregar al menos un producto al carrito.")
+                return
+            if not solicitante:
+                st.error("Debe seleccionar el sitio/unidad solicitante.")
+                return
+            if not personal:
+                st.error("Debe seleccionar el personal que entrega.")
+                return
+            # Validación final contra stock actual en pantalla.
+            for item in cart:
+                same = [x for x in cart if x.get("item_key") == item.get("item_key")]
+                qty_same = sum(float(x.get("cantidad", 0) or 0) for x in same)
+                if qty_same > float(item.get("stock_disponible", 0) or 0):
+                    st.error(f"La cantidad del lote {item.get('lote')} supera el stock disponible.")
+                    return
+            acta_id = f"ACTA-{pd.Timestamp.now().strftime('%Y%m%d%H%M%S')}"
+            ids = next_movement_ids(movimientos, len(cart))
+            rows = []
+            for mov_id, item in zip(ids, cart):
+                rows.append({
+                    "movimiento_id": mov_id,
+                    "fecha": pd.to_datetime(fecha).strftime("%Y-%m-%d"),
+                    "tipo_movimiento": "Salida",
+                    "producto_id": item["producto_id"],
+                    "producto": item["producto"],
+                    "marca": item["marca"],
+                    "lote": item["lote"],
+                    "proveedor": "",
+                    "orden_compra": "",
+                    "solicitante": solicitante,
+                    "personal": personal,
+                    "fecha_elaboracion": "",
+                    "fecha_vencimiento": item["fecha_vencimiento"],
+                    "unidad": item["unidad"],
+                    "cantidad": item["cantidad"],
+                    "costo_total": 0,
+                    "observacion": observacion,
+                    "usuario_registro": usuario,
+                    "fecha_registro": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "acta_entrega_id": acta_id,
+                })
+            storage.append_rows("Movimientos", rows)
+            if generar_acta:
+                personal_info = get_first_match(personal_df, "nombre", personal)
+                pdf_bytes = build_acta_entrega_pdf(rows, solicitante_info, personal_info, fecha, recibe_nombre, recibe_cargo, observacion=observacion)
+                st.session_state["last_acta_pdf"] = pdf_bytes
+                st.session_state["last_acta_filename"] = f"acta_entrega_{acta_id}_{clean_str(solicitante).replace(' ', '_')}.pdf"
+                st.session_state["last_acta_id"] = acta_id
+            st.session_state["salida_cart"] = []
+            _sync_after_save(rows, f"Salida guardada correctamente: {len(rows)} insumo(s) registrados individualmente. Acta: {acta_id}.")
+        return
 
     # ========================================================
-    # 2) Datos del movimiento: datos generales y lote
+    # DEVOLUCIÓN DESDE SALIDAS REGISTRADAS
+    # ========================================================
+    if tipo == "Devolución":
+        st.markdown("<div class='form-card'>", unsafe_allow_html=True)
+        st.markdown("#### 1) Seleccionar salida relacionada")
+        salidas = movimientos[movimientos["tipo_movimiento"].astype(str).isin(["Salida", "Corrección salida", "Ajuste salida"])].copy()
+        if salidas.empty:
+            st.info("Aún no hay salidas registradas para devolver.")
+            st.markdown("</div>", unsafe_allow_html=True)
+            return
+        salidas["fecha_dt"] = to_date(salidas["fecha"])
+        salidas = salidas.sort_values(["fecha_dt", "producto", "lote"], ascending=[False, True, True]).reset_index(drop=True)
+        vista_salidas = salidas[["movimiento_id", "fecha", "producto", "marca", "lote", "fecha_vencimiento", "unidad", "cantidad", "solicitante", "personal", "acta_entrega_id"]].copy()
+        st.dataframe(vista_salidas, use_container_width=True, hide_index=True)
+        salidas["label"] = salidas.apply(lambda r: f"{r['movimiento_id']} | {r['fecha']} | {r['producto']} | Lote {r['lote']} | Cant. {r['cantidad']} {r['unidad']} | {r['solicitante']}", axis=1)
+        label = st.selectbox("Salida a devolver", salidas["label"].tolist())
+        salida_row = salidas[salidas["label"] == label].iloc[0]
+        prod_row = _catalog_row_by_id(clean_str(salida_row["producto_id"]))
+        if clean_str(prod_row.get("nombre_producto", "")) == "":
+            prod_row["nombre_producto"] = salida_row["producto"]
+            prod_row["marca_default"] = salida_row["marca"]
+            prod_row["unidad_default"] = salida_row["unidad"]
+        _product_card(prod_row, "Producto seleccionado desde una salida registrada")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        mov_nonce = int(st.session_state.get("mov_form_nonce", 0))
+        st.markdown("<div class='form-card'>", unsafe_allow_html=True)
+        with st.form(f"frm_devolucion_{mov_nonce}", clear_on_submit=True):
+            st.markdown("#### 2) Datos de devolución")
+            a, b, c = st.columns(3)
+            fecha = a.date_input("Fecha de devolución", value=TODAY.date())
+            usuario = b.text_input("Usuario que registra", value=st.session_state.get("nombre_usuario", "Usuario"))
+            max_qty = float(salida_row.get("cantidad", 0) or 0)
+            cantidad = c.number_input("Cantidad a devolver", min_value=0.0, max_value=max_qty, step=1.0, format="%.2f")
+            d, e, f = st.columns(3)
+            d.text_input("Producto", value=clean_str(salida_row["producto"]), disabled=True)
+            e.text_input("Lote", value=clean_str(salida_row["lote"]), disabled=True)
+            f.text_input("Unidad", value=clean_str(salida_row["unidad"]), disabled=True)
+            g, h = st.columns(2)
+            solicitante_default = clean_str(salida_row.get("solicitante", ""))
+            opciones_solic = [""] + solicitantes["unidad_solicitante"].dropna().astype(str).sort_values().tolist()
+            idx_solic = opciones_solic.index(solicitante_default) if solicitante_default in opciones_solic else 0
+            quien_devuelve = g.selectbox("Quién devuelve *", opciones_solic, index=idx_solic)
+            personal = h.selectbox("Personal que recibe *", [""] + personal_df["nombre"].dropna().astype(str).sort_values().tolist())
+            observacion = st.text_area("Observación", value=f"Devolución relacionada con salida {clean_str(salida_row['movimiento_id'])}")
+            submitted = st.form_submit_button("💾 Guardar devolución", use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        if submitted:
+            if st.session_state.get("rol") == "Consulta":
+                st.error("El rol Consulta no puede registrar movimientos.")
+                return
+            if cantidad <= 0:
+                st.error("La cantidad a devolver debe ser mayor a cero.")
+                return
+            if not quien_devuelve:
+                st.error("Seleccione quién devuelve.")
+                return
+            row = {
+                "movimiento_id": next_code("MOV", movimientos, "movimiento_id", 6),
+                "fecha": pd.to_datetime(fecha).strftime("%Y-%m-%d"),
+                "tipo_movimiento": "Devolución",
+                "producto_id": clean_str(salida_row["producto_id"]),
+                "producto": clean_str(salida_row["producto"]),
+                "marca": clean_str(salida_row["marca"]),
+                "lote": clean_str(salida_row["lote"]),
+                "proveedor": "",
+                "orden_compra": "",
+                "solicitante": quien_devuelve,
+                "personal": personal,
+                "fecha_elaboracion": clean_str(salida_row.get("fecha_elaboracion", "")),
+                "fecha_vencimiento": format_date(salida_row.get("fecha_vencimiento", "")),
+                "unidad": clean_str(salida_row["unidad"]),
+                "cantidad": cantidad,
+                "costo_total": 0,
+                "observacion": observacion,
+                "usuario_registro": usuario,
+                "fecha_registro": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "acta_entrega_id": clean_str(salida_row.get("acta_entrega_id", "")),
+            }
+            storage.append_row("Movimientos", row)
+            _sync_after_save([row], "Devolución guardada correctamente. El lote fue actualizado en Kardex consolidado.")
+        return
+
+    # ========================================================
+    # CORRECCIÓN ENTRADA / SALIDA
     # ========================================================
     st.markdown("<div class='form-card'>", unsafe_allow_html=True)
+    st.markdown("#### 1) Seleccionar producto/lote para corrección")
+    disponibles = stock.copy() if not stock.empty else pd.DataFrame()
+    if disponibles.empty:
+        st.error("No hay lotes registrados para aplicar una corrección.")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+    if tipo == "Corrección salida":
+        disponibles = disponibles[disponibles["stock_actual"] > 0].copy()
+    disponibles = disponibles.sort_values(["producto", "fecha_vencimiento", "lote"], na_position="last").reset_index(drop=True)
+    disponibles["label"] = disponibles.apply(
+        lambda r: f"{r['producto']} | Marca: {r['marca']} | Lote: {r['lote']} | Vence: {r['fecha_vencimiento']} | Stock: {float(r['stock_actual']):,.0f} {r['unidad']}",
+        axis=1,
+    )
+    label = st.selectbox("Producto/lote a corregir", disponibles["label"].tolist())
+    selected = disponibles[disponibles["label"] == label].iloc[0]
+    prod_row = _catalog_row_by_id(clean_str(selected["producto_id"]))
+    if clean_str(prod_row.get("nombre_producto", "")) == "":
+        prod_row["nombre_producto"] = selected["producto"]
+        prod_row["marca_default"] = selected["marca"]
+        prod_row["unidad_default"] = selected["unidad"]
+    _product_card(prod_row, "Producto seleccionado para corrección")
+    st.info(f"Stock actual del lote: {float(selected.get('stock_actual', 0) or 0):,.0f} {clean_str(selected.get('unidad', ''))}.")
+    st.markdown("</div>", unsafe_allow_html=True)
+
     mov_nonce = int(st.session_state.get("mov_form_nonce", 0))
-    with st.form(f"frm_movimiento_{mov_nonce}", clear_on_submit=True):
-        st.markdown("#### 2) Datos del movimiento")
-        col_a, col_b, col_c = st.columns([1, 1, 1])
-        fecha = col_a.date_input("Fecha del movimiento", value=TODAY.date())
-        usuario = col_b.text_input("Usuario que registra", value=st.session_state.get("nombre_usuario", "Usuario"))
-        cantidad = col_c.number_input("Cantidad", min_value=0.0, step=1.0, format="%.2f")
-
-        if is_salida:
-            st.markdown("#### 3) Datos automáticos del lote seleccionado")
-            l1, l2, l3, l4 = st.columns(4)
-            l1.text_input("Producto", value=producto, disabled=True)
-            l2.text_input("Marca", value=marca, disabled=True)
-            l3.text_input("Lote", value=lote, disabled=True)
-            l4.text_input("Unidad", value=unidad, disabled=True)
-            v1, v2 = st.columns([1, 2])
-            v1.text_input("Fecha de vencimiento", value=fecha_vencimiento, disabled=True)
-            v2.text_input("Stock disponible", value=f"{stock_disponible:,.0f} {unidad}", disabled=True)
-            fecha_elaboracion = ""
-            costo_total = 0.0
-        else:
-            st.markdown("#### 3) Datos del lote / presentación")
-            unidades = sorted(set([u for u in UNIDADES_DEFAULT + [unidad_default] if clean_str(u)]))
-            unidad_index = unidades.index(unidad_default) if unidad_default in unidades else 0
-            col1, col2, col3 = st.columns([1, 1, 1])
-            marca = col1.text_input(
-                "Marca",
-                value=marca_default,
-                key=f"mov_marca_{mov_nonce}_{tipo}_{producto_id}",
-                help="Se carga desde el catálogo del producto."
-            )
-            lote = col2.text_input("Lote *", placeholder="Ejemplo: AB-2026-001", key=f"mov_lote_{mov_nonce}_{tipo}_{producto_id}")
-            unidad = col3.selectbox(
-                "Unidad",
-                unidades,
-                index=unidad_index,
-                key=f"mov_unidad_{mov_nonce}_{tipo}_{producto_id}",
-                help="Se carga desde el catálogo del producto."
-            )
-            col4, col5, col6 = st.columns([1, 1, 1])
-            fecha_elaboracion_dt = col4.date_input("Fecha de elaboración", value=TODAY.date(), key=f"mov_elab_{mov_nonce}_{tipo}_{producto_id}")
-            fecha_vencimiento_dt = col5.date_input("Fecha de vencimiento", value=(TODAY + pd.Timedelta(days=365)).date(), key=f"mov_venc_{mov_nonce}_{tipo}_{producto_id}")
-            costo_total = col6.number_input("Costo total", min_value=0.0, step=1.0, format="%.2f", key=f"mov_costo_{mov_nonce}_{tipo}_{producto_id}")
-            fecha_elaboracion = fecha_elaboracion_dt.strftime("%Y-%m-%d")
-            fecha_vencimiento = fecha_vencimiento_dt.strftime("%Y-%m-%d")
-
-        st.markdown("#### 4) Origen / destino / responsable")
-        colx, coly, colz = st.columns([1, 1, 1])
-        if tipo == "Ingreso":
-            proveedor = colx.selectbox("Proveedor *", [""] + proveedores["proveedor"].dropna().astype(str).sort_values().tolist())
-            personal = coly.selectbox("Personal que recibe", [""] + personal_df["nombre"].dropna().astype(str).sort_values().tolist())
-            colz.text_input("Destino", value="Bodega / Inventario", disabled=True)
-        elif tipo in ["Salida", "Ajuste salida"]:
-            solicitante = colx.selectbox("Entregado a / solicitante *", [""] + solicitantes["unidad_solicitante"].dropna().astype(str).sort_values().tolist())
-            personal = coly.selectbox("Personal que entrega", [""] + personal_df["nombre"].dropna().astype(str).sort_values().tolist())
-            colz.text_input("Origen", value="Bodega / Inventario", disabled=True)
-        elif tipo == "Devolución":
-            solicitante = colx.selectbox("Quién devuelve", [""] + solicitantes["unidad_solicitante"].dropna().astype(str).sort_values().tolist())
-            personal = coly.selectbox("Personal que recibe", [""] + personal_df["nombre"].dropna().astype(str).sort_values().tolist())
-            colz.text_input("Destino", value="Bodega / Inventario", disabled=True)
-        else:
-            personal = colx.selectbox("Personal responsable", [""] + personal_df["nombre"].dropna().astype(str).sort_values().tolist())
-            coly.text_input("Tipo de ajuste", value=tipo, disabled=True)
-            colz.text_input("Destino", value="Bodega / Inventario", disabled=True)
-
-        st.markdown("#### 5) Observación")
-        observacion = st.text_area("Observación / justificación", placeholder="Detalle de factura, solicitud, ajuste, entrega o comentario relevante.")
-        submitted = st.form_submit_button("💾 Guardar movimiento", use_container_width=True)
+    st.markdown("<div class='form-card'>", unsafe_allow_html=True)
+    with st.form(f"frm_correccion_{mov_nonce}", clear_on_submit=True):
+        st.markdown("#### 2) Datos de corrección")
+        a, b, c = st.columns(3)
+        fecha = a.date_input("Fecha de corrección", value=TODAY.date())
+        usuario = b.text_input("Usuario que registra", value=st.session_state.get("nombre_usuario", "Usuario"))
+        cantidad = c.number_input("Cantidad", min_value=0.0, step=1.0, format="%.2f")
+        d, e, f = st.columns(3)
+        d.text_input("Producto", value=clean_str(selected["producto"]), disabled=True)
+        e.text_input("Lote", value=clean_str(selected["lote"]), disabled=True)
+        f.text_input("Unidad", value=clean_str(selected["unidad"]), disabled=True)
+        g, h = st.columns(2)
+        persona_relacionada = g.selectbox("Persona / sitio relacionado *", [""] + solicitantes["unidad_solicitante"].dropna().astype(str).sort_values().tolist())
+        personal = h.selectbox("Personal responsable *", [""] + personal_df["nombre"].dropna().astype(str).sort_values().tolist())
+        observacion = st.text_area("Justificación de la corrección *", placeholder="Explique la razón de la corrección para auditoría.")
+        submitted = st.form_submit_button("💾 Guardar corrección", use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
     if submitted:
@@ -2063,57 +2497,42 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
         if cantidad <= 0:
             st.error("La cantidad debe ser mayor a cero.")
             return
-        if is_salida and selected_stock_row is not None and cantidad > float(selected_stock_row["stock_actual"]):
-            st.error("La salida no puede ser mayor al stock disponible del lote seleccionado.")
+        if tipo == "Corrección salida" and cantidad > float(selected.get("stock_actual", 0) or 0):
+            st.error("La corrección de salida no puede superar el stock actual del lote.")
             return
-        if not lote:
-            st.error("El lote es obligatorio.")
+        if not persona_relacionada:
+            st.error("Seleccione la persona o sitio relacionado con la corrección.")
             return
-        if tipo == "Ingreso" and not proveedor:
-            st.error("Para ingresos debe seleccionar proveedor.")
+        if not personal:
+            st.error("Seleccione el personal responsable.")
             return
-        if tipo in ["Salida", "Ajuste salida"] and not solicitante:
-            st.error("Para salidas debe seleccionar solicitante/unidad.")
+        if not observacion:
+            st.error("La justificación es obligatoria para registrar una corrección.")
             return
-
-        mov_df = data["Movimientos"]
         row = {
-            "movimiento_id": next_code("MOV", mov_df, "movimiento_id", 6),
+            "movimiento_id": next_code("MOV", movimientos, "movimiento_id", 6),
             "fecha": pd.to_datetime(fecha).strftime("%Y-%m-%d"),
             "tipo_movimiento": tipo,
-            "producto_id": producto_id,
-            "producto": producto,
-            "marca": marca,
-            "lote": lote,
-            "proveedor": proveedor,
-            "solicitante": solicitante,
+            "producto_id": clean_str(selected["producto_id"]),
+            "producto": clean_str(selected["producto"]),
+            "marca": clean_str(selected["marca"]),
+            "lote": clean_str(selected["lote"]),
+            "proveedor": "",
+            "orden_compra": "",
+            "solicitante": persona_relacionada,
             "personal": personal,
-            "fecha_elaboracion": fecha_elaboracion,
-            "fecha_vencimiento": fecha_vencimiento,
-            "unidad": unidad,
+            "fecha_elaboracion": "",
+            "fecha_vencimiento": format_date(selected.get("fecha_vencimiento", "")),
+            "unidad": clean_str(selected["unidad"]),
             "cantidad": cantidad,
-            "costo_total": costo_total,
+            "costo_total": 0,
             "observacion": observacion,
             "usuario_registro": usuario,
             "fecha_registro": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "acta_entrega_id": "",
         }
         storage.append_row("Movimientos", row)
-
-        # Actualizar hoja física Kardex_Consolidado para que el stock actual
-        # también quede visible en Google Sheets/Excel y no solo dentro de Streamlit.
-        sync_data = dict(data)
-        sync_data["Movimientos"] = ensure_columns(
-            pd.concat([ensure_columns(data["Movimientos"], "Movimientos"), pd.DataFrame([row])], ignore_index=True),
-            "Movimientos",
-        )
-        try:
-            sync_kardex_consolidado_sheet(storage, sync_data)
-            set_flash("Movimiento guardado correctamente. El formulario quedó limpio y el Kardex consolidado fue actualizado en la hoja de base.")
-        except Exception as exc:
-            set_flash(f"Movimiento guardado. El formulario quedó limpio, pero no se pudo actualizar la hoja Kardex_Consolidado: {exc}", "warning")
-        bump_form_nonce("mov_form_nonce")
-        rerun()
-
+        _sync_after_save([row], "Corrección guardada correctamente. El Kardex consolidado fue actualizado.")
 
 def page_kardex_consolidado(kardex: pd.DataFrame, storage=None, data: Dict[str, pd.DataFrame] | None = None, mode: str = "") -> None:
     section_header(

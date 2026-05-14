@@ -85,7 +85,7 @@ En la pantalla de login el sistema mostrará un apartado llamado **Código PATH 
 
 - Ruta de navegación guiada para que el usuario avance en el orden correcto del Kardex.
 - Dashboard ejecutivo con KPIs de stock, productos activos, movimientos del mes y alertas.
-- Registro de movimientos: Ingreso, Salida, Devolución, Ajuste entrada y Ajuste salida.
+- Registro de movimientos: Ingreso, Salida, Devolución, Corrección entrada y Corrección salida.
 - Control de stock por producto, marca, lote, vencimiento y unidad.
 - Validación para evitar salidas mayores al stock disponible.
 - Alertas automáticas por vencimiento, productos vencidos y stock bajo.
@@ -166,11 +166,11 @@ Historial transaccional. Esta hoja es la fuente principal para calcular stock.
 Tipos positivos de stock:
 - Ingreso
 - Devolución
-- Ajuste entrada
+- Corrección entrada
 
 Tipos negativos de stock:
 - Salida
-- Ajuste salida
+- Corrección salida
 
 ### Stock actual
 No se registra manualmente. El sistema lo calcula agrupando movimientos por producto, marca, lote, vencimiento y unidad.
@@ -281,3 +281,20 @@ Esta versión reduce el error `APIError [429]: Quota exceeded` usando:
 - Diagnóstico sin re-leer todas las pestañas desde Google Sheets.
 
 Si aparece un error 429, espere al menos 60 segundos y reinicie/recargue la app.
+
+## V18 - Salidas por carrito, orden de compra, devoluciones y acta PDF
+
+La versión V18 mejora el flujo operativo:
+
+- Salidas con carrito de múltiples insumos.
+- Registro individual por cada insumo en Google Sheets.
+- Campo nuevo `orden_compra` en ingresos.
+- Devolución desde una tabla de salidas históricas.
+- Cambio de `Ajuste` a `Corrección`.
+- Acta de entrega PDF generada al guardar una salida.
+
+Para el acta PDF, asegúrese de que `requirements.txt` incluya:
+
+```text
+reportlab>=4.2.0
+```

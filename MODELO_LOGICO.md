@@ -27,9 +27,9 @@ Cada movimiento suma o resta inventario según su tipo:
 |---|---:|
 | Ingreso | Suma |
 | Devolución | Suma |
-| Ajuste entrada | Suma |
+| Corrección entrada | Suma |
 | Salida | Resta |
-| Ajuste salida | Resta |
+| Corrección salida | Resta |
 
 El stock y el Kardex consolidado se agrupan por:
 
