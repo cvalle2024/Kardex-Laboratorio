@@ -319,3 +319,8 @@ La V24 agrega gestión profesional de catálogos y movimientos:
 - Nuevas hojas en la base: `Permisos_Usuarios` y `Auditoria_Cambios`.
 
 Regla clave: los movimientos del Kardex no se eliminan; se anulan o corrigen para conservar trazabilidad.
+
+
+## V25 - Corrección de estructura Google Sheets
+
+Esta versión agrega migración automática para crear las hojas nuevas `Permisos_Usuarios` y `Auditoria_Cambios` si la base fue creada con una versión anterior. Se recomienda tener en Secrets: `AUTO_MIGRATE_GOOGLE_SHEETS = true`.

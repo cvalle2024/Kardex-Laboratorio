@@ -547,8 +547,9 @@ def diagnose_gsheets_error(exc: Exception) -> str:
     msg = str(exc)
     low = msg.lower()
     tips = []
-    if "invalid argument" in low or "[400]" in low:
+    if "invalid argument" in low or "[400]" in low or "unable to parse range" in low:
         tips.append("Verifique que GOOGLE_SHEET_ID sea el ID real de la hoja o una URL válida de Google Sheets. Esta versión ya extrae el ID si pega la URL completa.")
+        tips.append("Si el error menciona unable to parse range, puede faltar una pestaña en Google Sheets; active AUTO_MIGRATE_GOOGLE_SHEETS=true o cree la estructura desde Administración.")
         tips.append("Confirme que la hoja exista y no sea un archivo Excel subido a Drive sin convertir a Google Sheets.")
         tips.append("Revise que los secretos TOML no tengan comillas faltantes, especialmente en private_key.")
     if "permission" in low or "forbidden" in low or "403" in low:
@@ -686,11 +687,13 @@ class GoogleSheetsStorage:
         self.base_url = f"https://sheets.googleapis.com/v4/spreadsheets/{self.sheet_id}"
         self._sheet_ids: Dict[str, int] = {}
 
-        # Prepara pestañas con operaciones de escritura. Esto evita la llamada de metadata
-        # que estaba disparando el error 429 en open_by_key()/fetch_sheet_metadata.
+        # Prepara solo las pestañas BASE con operaciones de escritura.
+        # No fuerza Kardex_Consolidado al iniciar porque es calculada.
+        # Esto evita detener la app cuando se agregan nuevas hojas en versiones recientes
+        # y también reduce llamadas innecesarias a Google Sheets.
         auto_create = as_bool(safe_secret("AUTO_CREATE_SHEETS", True), True)
         if auto_create:
-            self.ensure_database_write_only()
+            self.ensure_sheets_write_only(CORE_SHEETS)
 
     def _request(self, method: str, url: str, *, ok_empty: bool = False, **kwargs):
         """Ejecuta una llamada REST con reintentos para 429/5xx."""
@@ -980,18 +983,31 @@ class GoogleSheetsStorage:
                 f"Detalle API: {exception_detail(exc)}. Revisión: {diagnose_gsheets_error(exc)}"
             ) from exc
 
-    def ensure_database_write_only(self) -> None:
+    def ensure_sheets_write_only(self, sheets: list[str] | None = None) -> None:
         """Crea pestañas faltantes y escribe encabezados sin leer metadata.
 
-        V15: la hoja Kardex_Consolidado se crea, pero ya no se lee al iniciar
-        porque es una hoja calculada. Esto evita detener el sistema si esa pestaña
-        física aún no existe o si Google Sheets limita lecturas de estructura.
+        Esta función se usa como migración automática cuando una versión nueva del
+        sistema agrega hojas como Permisos_Usuarios o Auditoria_Cambios. No borra
+        registros existentes: solo crea pestañas faltantes y actualiza la fila 1
+        con los encabezados esperados.
         """
-        for sheet in SHEET_COLUMNS.keys():
-            self._create_sheet_and_header(sheet)
+        target_sheets = list(sheets or SHEET_COLUMNS.keys())
+        for sheet in target_sheets:
+            if sheet in SHEET_COLUMNS:
+                self._create_sheet_and_header(sheet)
 
-    def load_many(self, sheets: list[str]) -> Dict[str, pd.DataFrame]:
-        """Carga varias pestañas con una sola lectura real a la API."""
+    def ensure_database_write_only(self) -> None:
+        """Crea todas las pestañas de la base sin leer metadata."""
+        self.ensure_sheets_write_only(list(SHEET_COLUMNS.keys()))
+
+    def load_many(self, sheets: list[str], _retry_migration: bool = True) -> Dict[str, pd.DataFrame]:
+        """Carga varias pestañas con una sola lectura real a la API.
+
+        Si Google devuelve error porque una pestaña agregada por una versión nueva
+        todavía no existe, el sistema crea automáticamente las hojas base y vuelve
+        a intentar la lectura una vez. Esto evita detener el sistema con el mensaje
+        general de "falló al leer la estructura de la base".
+        """
         ranges = [sheet_range_for(sheet) for sheet in sheets]
         params = []
         for rng in ranges:
@@ -1000,9 +1016,34 @@ class GoogleSheetsStorage:
         try:
             result = self._request("get", f"{self.base_url}/values:batchGet", params=params)
         except Exception as exc:
+            detail = exception_detail(exc)
+            low = detail.lower()
+            should_migrate = (
+                _retry_migration
+                and as_bool(safe_secret("AUTO_MIGRATE_GOOGLE_SHEETS", True), True)
+                and any(term in low for term in [
+                    "unable to parse range",
+                    "not found",
+                    "bad request",
+                    "[400]",
+                    "requested entity was not found",
+                    "cannot find grid",
+                ])
+            )
+            if should_migrate:
+                try:
+                    self.ensure_sheets_write_only(sheets)
+                    time.sleep(2)
+                    return self.load_many(sheets, _retry_migration=False)
+                except Exception as mig_exc:
+                    raise RuntimeError(
+                        "No se pudo leer Google Sheets y tampoco se pudo completar la migración automática de estructura. "
+                        f"Detalle lectura inicial: {detail}. Detalle migración: {exception_detail(mig_exc)}. "
+                        f"Revisión: {diagnose_gsheets_error(mig_exc)}"
+                    ) from mig_exc
             raise RuntimeError(
                 "No se pudo leer Google Sheets por lote. "
-                f"Detalle API: {exception_detail(exc)}. Revisión: {diagnose_gsheets_error(exc)}"
+                f"Detalle API: {detail}. Revisión: {diagnose_gsheets_error(exc)}"
             ) from exc
 
         value_ranges = result.get("valueRanges", []) if isinstance(result, dict) else []
@@ -3968,6 +4009,10 @@ def main() -> None:
         )
         st.code(exception_detail(exc))
         st.info(diagnose_gsheets_error(exc))
+        st.warning(
+            "Sugerencia V25: verifique que en Secrets esté AUTO_MIGRATE_GOOGLE_SHEETS = true. "
+            "Esta versión crea automáticamente las hojas nuevas de auditoría/permisos si faltan."
+        )
         st.stop()
 
     if not render_login(storage, data, mode):
