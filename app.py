@@ -2076,6 +2076,70 @@ def get_first_match(df: pd.DataFrame, col: str, value: str) -> dict:
     return {k: clean_str(v) for k, v in m.iloc[0].to_dict().items()}
 
 
+def join_spanish(items: list[str]) -> str:
+    """Une una lista corta en español: A, B y C."""
+    items = [clean_str(x) for x in items if clean_str(x)]
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} y {items[1]}"
+    return f"{', '.join(items[:-1])} y {items[-1]}"
+
+
+def categoria_acta_plural(categoria: str) -> str:
+    """Convierte la categoría del catálogo en el texto que se imprime en el acta."""
+    cat = clean_str(categoria).strip().lower()
+    if not cat:
+        return "productos"
+
+    # Normalización flexible por si el catálogo tiene variantes escritas por usuarios.
+    if "react" in cat or "prueba" in cat or "test" in cat:
+        return "reactivos"
+    if "insumo" in cat:
+        return "insumos"
+    if "equipo" in cat:
+        return "equipos"
+    if "material" in cat:
+        return "materiales"
+    if "papeler" in cat:
+        return "materiales de papelería"
+    if "medic" in cat or "fárm" in cat or "farm" in cat:
+        return "medicamentos"
+    if "control" in cat:
+        return "controles"
+    if "calibr" in cat:
+        return "calibradores"
+    if "consum" in cat:
+        return "consumibles"
+
+    # Fallback conservador: si ya viene en plural, se respeta; si no, se agrega "s".
+    if cat.endswith("s"):
+        return cat
+    return f"{cat}s"
+
+
+def acta_tipo_entrega_desde_categorias(rows: list[dict]) -> str:
+    """Determina el texto: reactivos, insumos, equipos, etc., según categoría de los productos."""
+    categorias = []
+    for r in rows or []:
+        categoria = clean_str(r.get("categoria", ""))
+        plural = categoria_acta_plural(categoria)
+        if plural and plural not in categorias:
+            categorias.append(plural)
+
+    if not categorias:
+        return "productos"
+
+    # Si hay demasiadas categorías, se usa una frase compacta para no saturar la redacción.
+    if len(categorias) > 4:
+        principales = categorias[:3]
+        return f"{join_spanish(principales)} y otros productos"
+
+    return join_spanish(categorias)
+
+
 def build_acta_entrega_pdf(
     salida_rows: list[dict],
     solicitante_info: dict,
@@ -2085,6 +2149,7 @@ def build_acta_entrega_pdf(
     recibe_cargo: str = "",
     ciudad: str = "Tegucigalpa",
     observacion: str = "",
+    tipo_entrega_texto: str = "",
 ) -> bytes:
     """Genera acta de entrega en PDF basada en el diseño del acta de referencia.
 
@@ -2126,6 +2191,7 @@ def build_acta_entrega_pdf(
     recibe_cargo = clean_str(recibe_cargo) or "Responsable / receptor"
     entrega_nombre = clean_str(personal_info.get("nombre", "")) or clean_str(salida_rows[0].get("personal", "")) or "Personal que entrega"
     entrega_cargo = clean_str(personal_info.get("cargo", "")) or "Personal asignado"
+    tipo_entrega = clean_str(tipo_entrega_texto) or acta_tipo_entrega_desde_categorias(salida_rows)
 
     story = []
     # Logo institucional desde PNG real.
@@ -2155,7 +2221,7 @@ def build_acta_entrega_pdf(
     story.append(Spacer(1, 0.12 * inch))
     story.append(Paragraph(
         f"El motivo de la presente es para hacer de su conocimiento que como parte del apoyo que el "
-        f"Programa de VIH brinda en Honduras, se hace entrega formal de los siguientes reactivos e insumos "
+        f"Programa de VIH brinda en Honduras, se hace entrega formal de los siguientes {tipo_entrega} "
         f"para el procesamiento y uso en {sitio}.", normal
     ))
     story.append(Spacer(1, 0.24 * inch))
@@ -2494,6 +2560,7 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
                 if ya_en_carrito + cantidad_item > disponible:
                     st.error(f"No puede agregar {cantidad_item:,.0f}; ya tiene {ya_en_carrito:,.0f} en el carrito y el stock disponible es {disponible:,.0f}.")
                 else:
+                    prod_info_item = _catalog_row_by_id(clean_str(selected_stock_row.get("producto_id", "")))
                     st.session_state["salida_cart"].append({
                         "item_key": item_key,
                         "producto_id": clean_str(selected_stock_row["producto_id"]),
@@ -2502,6 +2569,7 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
                         "lote": clean_str(selected_stock_row["lote"]),
                         "fecha_vencimiento": format_date(selected_stock_row["fecha_vencimiento"]),
                         "unidad": clean_str(selected_stock_row["unidad"]),
+                        "categoria": clean_str(prod_info_item.get("categoria", "")),
                         "cantidad": cantidad_item,
                         "stock_disponible": disponible,
                     })
@@ -2548,6 +2616,13 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             recibe_nombre = e.text_input("Persona que recibe / firma", value=recibe_default)
             recibe_cargo = f.text_input("Cargo de quien recibe", value="Responsable del sitio")
             observacion = st.text_area("Observación para movimientos y acta", placeholder="Detalle de solicitud, referencia o comentario de entrega.")
+            tipo_entrega_auto = acta_tipo_entrega_desde_categorias(cart)
+            tipo_entrega_texto = st.text_input(
+                "Texto de categoría para el acta",
+                value=tipo_entrega_auto,
+                help="Se calcula automáticamente según la categoría del producto en el catálogo. Puede ajustarlo antes de generar el PDF. Ejemplo: reactivos, insumos, equipos, materiales."
+            )
+            st.caption(f"En el acta se imprimirá: 'se hace entrega formal de los siguientes {tipo_entrega_texto}...'")
             generar_acta = st.checkbox("Generar acta de entrega en PDF", value=True)
             submitted = st.form_submit_button("💾 Guardar salida y generar acta", use_container_width=True)
         st.markdown("</div>", unsafe_allow_html=True)
@@ -2592,6 +2667,7 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
                     "fecha_elaboracion": "",
                     "fecha_vencimiento": item["fecha_vencimiento"],
                     "unidad": item["unidad"],
+                    "categoria": clean_str(item.get("categoria", "")),
                     "cantidad": item["cantidad"],
                     "costo_total": 0,
                     "observacion": observacion,
@@ -2602,7 +2678,7 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             storage.append_rows("Movimientos", rows)
             if generar_acta:
                 personal_info = get_first_match(personal_df, "nombre", personal)
-                pdf_bytes = build_acta_entrega_pdf(rows, solicitante_info, personal_info, fecha, recibe_nombre, recibe_cargo, observacion=observacion)
+                pdf_bytes = build_acta_entrega_pdf(rows, solicitante_info, personal_info, fecha, recibe_nombre, recibe_cargo, observacion=observacion, tipo_entrega_texto=tipo_entrega_texto)
                 st.session_state["last_acta_pdf"] = pdf_bytes
                 st.session_state["last_acta_filename"] = f"acta_entrega_{acta_id}_{clean_str(solicitante).replace(' ', '_')}.pdf"
                 st.session_state["last_acta_id"] = acta_id
