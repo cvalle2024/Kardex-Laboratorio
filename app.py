@@ -49,18 +49,22 @@ KARDEX_CONSOLIDADO_COLUMNS: List[str] = [
 SHEET_COLUMNS: Dict[str, List[str]] = {
     "Productos": [
         "producto_id", "codigo_producto", "nombre_producto", "categoria", "marca_default",
-        "unidad_default", "stock_minimo", "dias_alerta_vencimiento", "activo", "observacion"
+        "unidad_default", "stock_minimo", "dias_alerta_vencimiento", "activo", "observacion",
+        "estado_registro", "creado_por", "fecha_creacion", "modificado_por", "fecha_modificacion", "motivo_modificacion"
     ],
     "Proveedores": [
         "proveedor_id", "proveedor", "descripcion", "ruc", "representante", "telefono",
-        "correo", "direccion", "activo"
+        "correo", "direccion", "activo",
+        "estado_registro", "creado_por", "fecha_creacion", "modificado_por", "fecha_modificacion", "motivo_modificacion"
     ],
     "Solicitantes": [
         "solicitante_id", "unidad_solicitante", "departamento", "municipio", "responsable",
-        "telefono", "correo", "activo"
+        "telefono", "correo", "activo",
+        "estado_registro", "creado_por", "fecha_creacion", "modificado_por", "fecha_modificacion", "motivo_modificacion"
     ],
     "Personal": [
-        "personal_id", "nombre", "cargo", "correo", "activo"
+        "personal_id", "nombre", "cargo", "correo", "activo",
+        "estado_registro", "creado_por", "fecha_creacion", "modificado_por", "fecha_modificacion", "motivo_modificacion"
     ],
     "Usuarios": [
         "usuario_id", "usuario", "nombre", "rol", "password_hash", "path_verificacion", "activo", "fecha_creacion"
@@ -68,11 +72,20 @@ SHEET_COLUMNS: Dict[str, List[str]] = {
     "Movimientos": [
         "movimiento_id", "fecha", "tipo_movimiento", "producto_id", "producto", "marca", "lote",
         "proveedor", "orden_compra", "solicitante", "personal", "fecha_elaboracion", "fecha_vencimiento",
-        "unidad", "cantidad", "costo_total", "observacion", "usuario_registro", "fecha_registro", "acta_entrega_id"
+        "unidad", "cantidad", "costo_total", "observacion", "usuario_registro", "fecha_registro", "acta_entrega_id",
+        "estado_movimiento", "anulado_por", "fecha_anulacion", "motivo_anulacion",
+        "modificado_por", "fecha_modificacion", "motivo_modificacion"
     ],
     # Hoja física en Google Sheets/Excel. Se calcula automáticamente desde Movimientos.
     # Esta hoja permite ver el stock actual en la misma base, sin depender solo de la vista de Streamlit.
     "Kardex_Consolidado": KARDEX_CONSOLIDADO_COLUMNS,
+    "Permisos_Usuarios": [
+        "usuario", "permiso", "valor", "fecha_asignacion", "asignado_por", "estado"
+    ],
+    "Auditoria_Cambios": [
+        "auditoria_id", "fecha_evento", "usuario", "rol", "accion", "modulo", "registro_id",
+        "campo", "valor_anterior", "valor_nuevo", "motivo", "detalle"
+    ],
     "Config": ["clave", "valor"],
 }
 
@@ -81,7 +94,8 @@ SHEET_COLUMNS: Dict[str, List[str]] = {
 # por eso NO debe ser requisito de lectura al arrancar. Si la pestaña no existe
 # todavía en Google Sheets, el sistema debe poder iniciar y crearla al sincronizar.
 CORE_SHEETS: List[str] = [
-    "Productos", "Proveedores", "Solicitantes", "Personal", "Usuarios", "Movimientos", "Config"
+    "Productos", "Proveedores", "Solicitantes", "Personal", "Usuarios",
+    "Movimientos", "Permisos_Usuarios", "Auditoria_Cambios", "Config"
 ]
 CALCULATED_SHEETS: List[str] = ["Kardex_Consolidado"]
 
@@ -104,7 +118,49 @@ UNIDADES_DEFAULT = [
     "TABLETAS", "FRASCOS", "RESMAS", "C/U", "SET", "ROLLOS", "PRUEBAS", "KIT",
     "UNIDAD", "CAJAS", "CAJITAS", "BOLSAS", "AMPOLLAS", "TUBOS", "PLACAS", "ML", "L"
 ]
-ROLES = ["Administrador", "Operador", "Consulta"]
+ROLES = ["Administrador", "Supervisor", "Operador", "Consulta"]
+
+PERMISSION_LABELS = {
+    "crear_productos": "Crear productos",
+    "editar_productos": "Editar productos",
+    "desactivar_productos": "Desactivar/reactivar productos",
+    "crear_proveedores": "Crear proveedores",
+    "editar_proveedores": "Editar proveedores",
+    "desactivar_proveedores": "Desactivar/reactivar proveedores",
+    "crear_solicitantes": "Crear solicitantes/sitios",
+    "editar_solicitantes": "Editar solicitantes/sitios",
+    "desactivar_solicitantes": "Desactivar/reactivar solicitantes/sitios",
+    "crear_personal": "Crear personal",
+    "editar_personal": "Editar personal",
+    "desactivar_personal": "Desactivar/reactivar personal",
+    "registrar_movimientos": "Registrar ingresos, salidas, devoluciones y correcciones",
+    "anular_movimientos": "Anular movimientos",
+    "editar_movimientos": "Editar datos administrativos de movimientos",
+    "exportar_reportes": "Exportar reportes",
+    "ver_auditoria": "Ver auditoría",
+}
+
+CATALOG_PERMISSION_BASE = {
+    "Productos": "productos",
+    "Proveedores": "proveedores",
+    "Solicitantes": "solicitantes",
+    "Personal": "personal",
+}
+
+ROLE_DEFAULT_PERMISSIONS = {
+    "Administrador": set(PERMISSION_LABELS.keys()),
+    "Supervisor": {
+        "crear_productos", "crear_proveedores", "crear_solicitantes", "crear_personal",
+        "editar_productos", "editar_proveedores", "editar_solicitantes", "editar_personal",
+        "registrar_movimientos", "anular_movimientos", "editar_movimientos",
+        "exportar_reportes", "ver_auditoria",
+    },
+    "Operador": {
+        "crear_productos", "crear_proveedores", "crear_solicitantes", "crear_personal",
+        "registrar_movimientos", "exportar_reportes",
+    },
+    "Consulta": {"exportar_reportes"},
+}
 
 # Orden de navegación recomendado según el flujo real de un Kardex.
 PAGE_INICIO = "1️⃣ Inicio / Ruta del Kardex"
@@ -244,7 +300,7 @@ INITIAL_DATA: Dict[str, pd.DataFrame] = {
         {"clave": "institucion", "valor": "Proyecto VIHCA"},
         {"clave": "path_verificacion", "valor": "DINAMICO"},
         {"clave": "path_ttl_minutos", "valor": str(PATH_TTL_MINUTES)},
-        {"clave": "version_sistema", "valor": "14.0"},
+        {"clave": "version_sistema", "valor": "24.0"},
     ], columns=SHEET_COLUMNS["Config"]),
 }
 
@@ -316,8 +372,12 @@ def active_mask(df: pd.DataFrame, col: str = "activo") -> pd.Series:
     if df.empty:
         return pd.Series([], dtype=bool, index=df.index)
     if col not in df.columns:
-        return pd.Series([True] * len(df), index=df.index)
-    return df[col].fillna("Sí").astype(str).str.lower().str.strip().isin(["sí", "si", "true", "1", "activo", ""])
+        mask = pd.Series([True] * len(df), index=df.index)
+    else:
+        mask = df[col].fillna("Sí").astype(str).str.lower().str.strip().isin(["sí", "si", "true", "1", "activo", ""])
+    if "estado_registro" in df.columns:
+        mask = mask & ~df["estado_registro"].fillna("Activo").astype(str).str.lower().str.strip().isin(["inactivo", "desactivado", "desactivada", "eliminado", "eliminada"])
+    return mask
 
 
 def ensure_columns(df: pd.DataFrame, sheet: str) -> pd.DataFrame:
@@ -327,6 +387,23 @@ def ensure_columns(df: pd.DataFrame, sheet: str) -> pd.DataFrame:
     for col in columns:
         if col not in df.columns:
             df[col] = ""
+
+    # Valores por defecto para mantener compatibilidad con bases creadas en versiones anteriores.
+    if sheet in ["Productos", "Proveedores", "Solicitantes", "Personal"]:
+        if "estado_registro" in df.columns:
+            df["estado_registro"] = df["estado_registro"].replace({np.nan: "", None: ""})
+            df.loc[df["estado_registro"].astype(str).str.strip().eq(""), "estado_registro"] = "Activo"
+        if "activo" in df.columns:
+            df["activo"] = df["activo"].replace({np.nan: "", None: ""})
+            df.loc[df["activo"].astype(str).str.strip().eq(""), "activo"] = "Sí"
+    if sheet == "Movimientos":
+        if "estado_movimiento" in df.columns:
+            df["estado_movimiento"] = df["estado_movimiento"].replace({np.nan: "", None: ""})
+            df.loc[df["estado_movimiento"].astype(str).str.strip().eq(""), "estado_movimiento"] = "Vigente"
+    if sheet == "Permisos_Usuarios":
+        if "estado" in df.columns:
+            df["estado"] = df["estado"].replace({np.nan: "", None: ""})
+            df.loc[df["estado"].astype(str).str.strip().eq(""), "estado"] = "Activo"
     return df[columns].copy()
 
 
@@ -1117,6 +1194,9 @@ def calcular_stock(df_mov: pd.DataFrame, df_prod: pd.DataFrame) -> pd.DataFrame:
         return stock_empty_frame()
 
     df = df.copy()
+    df = df[valid_movement_mask(df)].copy()
+    if df.empty:
+        return stock_empty_frame()
     df["cantidad_num"] = to_number(df["cantidad"])
     df["costo_total_num"] = to_number(df["costo_total"])
     df["tipo_movimiento"] = df["tipo_movimiento"].astype(str).str.strip()
@@ -1294,12 +1374,16 @@ def calcular_kardex_consolidado(df_mov: pd.DataFrame, df_prod: pd.DataFrame) -> 
         return pd.DataFrame(columns=columns)
 
     df = df.copy()
+    df = df[valid_movement_mask(df)].copy()
+    if df.empty:
+        return pd.DataFrame(columns=columns)
     df["cantidad_num"] = to_number(df["cantidad"])
     df["fecha_dt"] = to_date(df["fecha"])
     df["fecha_registro_dt"] = to_date(df["fecha_registro"])
     df["tipo_movimiento"] = df["tipo_movimiento"].astype(str).str.strip()
-    df["entrada"] = np.where(df["tipo_movimiento"].isin(TIPOS_POSITIVOS), df["cantidad_num"], 0)
-    df["salida"] = np.where(df["tipo_movimiento"].isin(TIPOS_NEGATIVOS), df["cantidad_num"], 0)
+    df["mov_sign"] = df["tipo_movimiento"].apply(movimiento_sign)
+    df["entrada"] = np.where(df["mov_sign"] > 0, df["cantidad_num"], 0)
+    df["salida"] = np.where(df["mov_sign"] < 0, df["cantidad_num"], 0)
 
     group_cols = ["producto_id", "producto", "marca", "lote", "fecha_vencimiento", "unidad"]
     base = (
@@ -1459,6 +1543,10 @@ def build_excel_report(data: Dict[str, pd.DataFrame], stock: pd.DataFrame, karde
         data["Proveedores"].to_excel(writer, index=False, sheet_name="Catalogo_Proveedores")
         data["Solicitantes"].to_excel(writer, index=False, sheet_name="Catalogo_Solicitantes")
         data["Personal"].to_excel(writer, index=False, sheet_name="Catalogo_Personal")
+        if "Permisos_Usuarios" in data:
+            data["Permisos_Usuarios"].to_excel(writer, index=False, sheet_name="Permisos_Usuarios")
+        if "Auditoria_Cambios" in data:
+            data["Auditoria_Cambios"].to_excel(writer, index=False, sheet_name="Auditoria_Cambios")
     output.seek(0)
     return output.read()
 
@@ -1590,7 +1678,7 @@ def hero(storage_mode: str, user_name: str = "") -> None:
         <div class="hero">
             <h1>📦 {APP_TITLE}</h1>
             <p>{APP_SUBTITLE}</p>
-            <div style="margin-top:12px"><span class='pill'>Base activa: {storage_mode}</span>{user_badge}<span class='pill'>Versión 17.0</span></div>
+            <div style="margin-top:12px"><span class='pill'>Base activa: {storage_mode}</span>{user_badge}<span class='pill'>Versión 24.0</span></div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1720,6 +1808,125 @@ def require_admin() -> bool:
         st.warning("Este módulo requiere rol de Administrador.")
         return False
     return True
+
+
+def current_username() -> str:
+    return clean_str(st.session_state.get("usuario", "Sistema")) or "Sistema"
+
+
+def current_user_display() -> str:
+    return clean_str(st.session_state.get("nombre_usuario", current_username())) or current_username()
+
+
+def current_role() -> str:
+    return clean_str(st.session_state.get("rol", ""))
+
+
+def is_admin() -> bool:
+    return current_role() == "Administrador"
+
+
+def permission_value_is_yes(value) -> bool:
+    return clean_str(value).lower() in {"sí", "si", "true", "1", "activo", "yes"}
+
+
+def user_has_permission(data: Dict[str, pd.DataFrame], permission: str) -> bool:
+    """Permisos efectivos por rol + excepciones asignadas por el administrador.
+
+    - Administrador siempre tiene todos los permisos.
+    - Supervisor/Operador/Consulta reciben permisos base.
+    - La hoja Permisos_Usuarios permite activar o negar permisos específicos por usuario.
+    """
+    role = current_role()
+    user = current_username().lower().strip()
+    if role == "Administrador":
+        return True
+
+    allowed = permission in ROLE_DEFAULT_PERMISSIONS.get(role, set())
+    permisos = ensure_columns(data.get("Permisos_Usuarios", pd.DataFrame()), "Permisos_Usuarios")
+    if not permisos.empty and user:
+        p = permisos[
+            (permisos["usuario"].astype(str).str.lower().str.strip() == user)
+            & (permisos["permiso"].astype(str).str.strip() == permission)
+            & (permisos["estado"].astype(str).str.lower().str.strip().isin(["activo", "sí", "si", "true", "1", ""]))
+        ]
+        if not p.empty:
+            allowed = permission_value_is_yes(p.iloc[-1].get("valor", "No"))
+    return bool(allowed)
+
+
+def require_permission(data: Dict[str, pd.DataFrame], permission: str, action_text: str = "realizar esta acción") -> bool:
+    if user_has_permission(data, permission):
+        return True
+    label = PERMISSION_LABELS.get(permission, permission)
+    st.warning(
+        f"No tiene permiso para {action_text}. Permiso requerido: {label}. "
+        "Solicite al administrador que le habilite este permiso si corresponde."
+    )
+    return False
+
+
+def append_audit(storage, accion: str, modulo: str, registro_id: str = "", campo: str = "", valor_anterior: str = "", valor_nuevo: str = "", motivo: str = "", detalle: str = "") -> None:
+    """Registra auditoría sin detener la operación si falla la escritura."""
+    try:
+        row = {
+            "auditoria_id": f"AUD-{uuid.uuid4().hex[:12].upper()}",
+            "fecha_evento": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "usuario": current_username(),
+            "rol": current_role(),
+            "accion": accion,
+            "modulo": modulo,
+            "registro_id": clean_str(registro_id),
+            "campo": clean_str(campo),
+            "valor_anterior": clean_str(valor_anterior),
+            "valor_nuevo": clean_str(valor_nuevo),
+            "motivo": clean_str(motivo),
+            "detalle": clean_str(detalle),
+        }
+        storage.append_row("Auditoria_Cambios", row)
+    except Exception:
+        # La auditoría no debe romper el guardado principal.
+        pass
+
+
+def append_audit_rows(storage, rows: list[dict]) -> None:
+    if not rows:
+        return
+    try:
+        storage.append_rows("Auditoria_Cambios", rows)
+    except Exception:
+        pass
+
+
+def catalog_id_col(sheet: str) -> str:
+    return {
+        "Productos": "producto_id",
+        "Proveedores": "proveedor_id",
+        "Solicitantes": "solicitante_id",
+        "Personal": "personal_id",
+    }.get(sheet, "")
+
+
+def catalog_display_col(sheet: str) -> str:
+    return {
+        "Productos": "nombre_producto",
+        "Proveedores": "proveedor",
+        "Solicitantes": "unidad_solicitante",
+        "Personal": "nombre",
+    }.get(sheet, "")
+
+
+def catalog_permission(sheet: str, action: str) -> str:
+    base = CATALOG_PERMISSION_BASE.get(sheet, sheet.lower())
+    return f"{action}_{base}"
+
+
+def valid_movement_mask(df: pd.DataFrame) -> pd.Series:
+    if df.empty:
+        return pd.Series([], dtype=bool, index=df.index)
+    if "estado_movimiento" not in df.columns:
+        return pd.Series([True] * len(df), index=df.index)
+    return ~df["estado_movimiento"].astype(str).str.lower().str.strip().isin(["anulado", "anulada", "cancelado", "cancelada"])
 
 
 def get_session_timeout_minutes() -> int:
@@ -2297,6 +2504,9 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
         "Ingreso, salida por carrito, devolución desde salidas históricas y correcciones de inventario con formularios guiados."
     )
 
+    if not require_permission(data, "registrar_movimientos", "registrar movimientos"):
+        return
+
     # V20: antes de registrar salidas/correcciones se verifica la base real.
     # En Google Sheets se hace una lectura por lote con caché corta para evitar cuota,
     # pero evitando que el carrito use datos viejos de una carga inicial.
@@ -2361,20 +2571,44 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             "Movimientos",
         )
         try:
+            audit_rows = []
+            for r in rows:
+                audit_rows.append({
+                    "auditoria_id": f"AUD-{uuid.uuid4().hex[:12].upper()}",
+                    "fecha_evento": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "usuario": current_username(),
+                    "rol": current_role(),
+                    "accion": "CREAR_MOVIMIENTO",
+                    "modulo": "Movimientos",
+                    "registro_id": clean_str(r.get("movimiento_id", "")),
+                    "campo": "",
+                    "valor_anterior": "",
+                    "valor_nuevo": clean_str(r.get("tipo_movimiento", "")),
+                    "motivo": "",
+                    "detalle": f"{clean_str(r.get('producto', ''))} | Lote: {clean_str(r.get('lote', ''))} | Cantidad: {clean_str(r.get('cantidad', ''))}",
+                })
+            append_audit_rows(storage, audit_rows)
             sync_kardex_consolidado_sheet(storage, sync_data)
             set_flash(message)
         except Exception as exc:
-            set_flash(f"Registros guardados. No se pudo actualizar Kardex_Consolidado: {exc}", "warning")
+            set_flash(f"Registros guardados. No se pudo actualizar Kardex_Consolidado o auditoría: {exc}", "warning")
         bump_form_nonce("mov_form_nonce")
         mark_data_dirty()
         rerun()
 
+    opciones_movimiento = list(TIPOS_MOVIMIENTO)
+    if user_has_permission(data, "anular_movimientos") or user_has_permission(data, "editar_movimientos"):
+        opciones_movimiento.append("Gestión de movimientos")
     tipo = st.radio(
         "Tipo de operación",
-        TIPOS_MOVIMIENTO,
+        opciones_movimiento,
         horizontal=True,
         help="Salida permite seleccionar varios insumos en un carrito. Devolución se basa en las salidas registradas. Ajuste ahora se llama Corrección."
     )
+
+    if tipo == "Gestión de movimientos":
+        render_movement_crud_controls(storage, data)
+        return
 
     # ========================================================
     # INGRESO
@@ -2427,8 +2661,7 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
         st.markdown("</div>", unsafe_allow_html=True)
 
         if submitted:
-            if st.session_state.get("rol") == "Consulta":
-                st.error("El rol Consulta no puede registrar movimientos.")
+            if not require_permission(data, "registrar_movimientos", "registrar movimientos"):
                 return
             if cantidad <= 0:
                 st.error("La cantidad debe ser mayor a cero.")
@@ -2628,8 +2861,7 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
         st.markdown("</div>", unsafe_allow_html=True)
 
         if submitted:
-            if st.session_state.get("rol") == "Consulta":
-                st.error("El rol Consulta no puede registrar movimientos.")
+            if not require_permission(data, "registrar_movimientos", "registrar movimientos"):
                 return
             cart = st.session_state.get("salida_cart", [])
             if not cart:
@@ -2766,8 +2998,7 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
         st.markdown("</div>", unsafe_allow_html=True)
 
         if submitted:
-            if st.session_state.get("rol") == "Consulta":
-                st.error("El rol Consulta no puede registrar movimientos.")
+            if not require_permission(data, "registrar_movimientos", "registrar movimientos"):
                 return
             if cantidad <= 0:
                 st.error("La cantidad a devolver debe ser mayor a cero.")
@@ -3114,6 +3345,9 @@ def product_form(storage, data: Dict[str, pd.DataFrame]) -> None:
             "dias_alerta_vencimiento": dias_alerta,
             "activo": activo,
             "observacion": observacion,
+            "estado_registro": "Activo",
+            "creado_por": current_username(),
+            "fecha_creacion": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
         })
         set_flash("Producto guardado correctamente. El formulario quedó limpio para registrar un nuevo producto.")
         rerun()
@@ -3152,6 +3386,9 @@ def provider_form(storage, data: Dict[str, pd.DataFrame]) -> None:
             "correo": correo,
             "direccion": direccion,
             "activo": activo,
+            "estado_registro": "Activo" if activo == "Sí" else "Inactivo",
+            "creado_por": current_username(),
+            "fecha_creacion": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         storage.append_row("Proveedores", row)
         set_flash("Proveedor guardado correctamente. El formulario quedó limpio para registrar un nuevo proveedor.")
@@ -3185,6 +3422,9 @@ def requester_form(storage, data: Dict[str, pd.DataFrame]) -> None:
             "telefono": telefono,
             "correo": correo,
             "activo": activo,
+            "estado_registro": "Activo" if activo == "Sí" else "Inactivo",
+            "creado_por": current_username(),
+            "fecha_creacion": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         storage.append_row("Solicitantes", row)
         set_flash("Solicitante guardado correctamente. El formulario quedó limpio para registrar una nueva unidad solicitante.")
@@ -3211,6 +3451,9 @@ def staff_form(storage, data: Dict[str, pd.DataFrame]) -> None:
             "cargo": cargo,
             "correo": correo,
             "activo": activo,
+            "estado_registro": "Activo" if activo == "Sí" else "Inactivo",
+            "creado_por": current_username(),
+            "fecha_creacion": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         storage.append_row("Personal", row)
         set_flash("Personal guardado correctamente. El formulario quedó limpio para registrar un nuevo personal.")
@@ -3218,32 +3461,144 @@ def staff_form(storage, data: Dict[str, pd.DataFrame]) -> None:
 
 
 def catalog_editor(storage, data: Dict[str, pd.DataFrame], sheet: str, title: str) -> None:
-    card_start(title, "Busque, revise y edite la tabla completa cuando necesite ajustes masivos.")
+    """CRUD controlado de catálogos.
+
+    No elimina físicamente registros: los desactiva/reactiva para conservar trazabilidad
+    y evitar romper movimientos históricos.
+    """
+    card_start(title, "Consulte, edite o desactive registros según sus permisos. Los cambios quedan auditados.")
     df = ensure_columns(data[sheet], sheet)
+    id_col = catalog_id_col(sheet)
+    name_col = catalog_display_col(sheet)
+    base = CATALOG_PERMISSION_BASE.get(sheet, sheet.lower())
+
     search = st.text_input(f"Buscar en {title}", key=f"search_{sheet}")
     view = df.copy()
     if search:
         mask = view.astype(str).apply(lambda col: col.str.contains(search, case=False, na=False)).any(axis=1)
         view = view[mask]
-    edited = st.data_editor(view, num_rows="dynamic", use_container_width=True, key=f"editor_{sheet}")
-    if st.button(f"💾 Guardar cambios en {title}", key=f"save_{sheet}", use_container_width=True):
-        if search:
-            st.warning("Para guardar edición masiva, quite el filtro de búsqueda para evitar perder filas no visibles.")
+
+    st.dataframe(view, use_container_width=True, hide_index=True)
+
+    can_edit = user_has_permission(data, f"editar_{base}")
+    can_deactivate = user_has_permission(data, f"desactivar_{base}")
+    if not can_edit and not can_deactivate:
+        st.info("Puede consultar este catálogo. Para modificar o desactivar registros, solicite permiso al administrador.")
+        return
+
+    if df.empty or not id_col or not name_col:
+        st.info("No hay registros para gestionar.")
+        return
+
+    labels = df.apply(lambda r: f"{clean_str(r.get(name_col, ''))} | ID: {clean_str(r.get(id_col, ''))} | Estado: {clean_str(r.get('activo', 'Sí'))}", axis=1).tolist()
+    selected_label = st.selectbox(f"Seleccionar registro para gestionar - {title}", labels, key=f"sel_crud_{sheet}")
+    selected_idx = labels.index(selected_label)
+    selected = df.iloc[selected_idx].copy()
+    registro_id = clean_str(selected.get(id_col, ""))
+
+    editable_cols = [
+        c for c in SHEET_COLUMNS[sheet]
+        if c not in {id_col, "creado_por", "fecha_creacion", "modificado_por", "fecha_modificacion", "motivo_modificacion"}
+    ]
+    values = {}
+    with st.form(f"frm_crud_{sheet}_{registro_id}"):
+        st.markdown("##### Datos del registro")
+        cols = st.columns(2)
+        for idx, col in enumerate(editable_cols):
+            current = selected.get(col, "")
+            label = col.replace("_", " ").title()
+            with cols[idx % 2]:
+                if col in ["activo"]:
+                    opts = ["Sí", "No"]
+                    cur = clean_str(current) or "Sí"
+                    values[col] = st.selectbox(label, opts, index=opts.index(cur) if cur in opts else 0, disabled=not can_edit)
+                elif col == "estado_registro":
+                    opts = ["Activo", "Inactivo"]
+                    cur = clean_str(current) or "Activo"
+                    values[col] = st.selectbox(label, opts, index=opts.index(cur) if cur in opts else 0, disabled=not can_edit)
+                elif col in ["stock_minimo", "dias_alerta_vencimiento"]:
+                    values[col] = st.number_input(label, min_value=0.0, value=float(to_number(pd.Series([current])).iloc[0]), step=1.0, disabled=not can_edit)
+                elif col == "observacion" or "direccion" in col or "descripcion" in col:
+                    values[col] = st.text_area(label, value=clean_str(current), disabled=not can_edit)
+                else:
+                    values[col] = st.text_input(label, value=clean_str(current), disabled=not can_edit)
+        motivo = st.text_area("Motivo del cambio *", placeholder="Explique por qué se edita, desactiva o reactiva este registro.")
+        c1, c2, c3 = st.columns(3)
+        save_btn = c1.form_submit_button("💾 Guardar cambios", disabled=not can_edit, use_container_width=True)
+        deactivate_btn = c2.form_submit_button("🚫 Desactivar", disabled=not can_deactivate, use_container_width=True)
+        reactivate_btn = c3.form_submit_button("✅ Reactivar", disabled=not can_deactivate, use_container_width=True)
+
+    if save_btn or deactivate_btn or reactivate_btn:
+        if not motivo:
+            st.error("Debe ingresar el motivo del cambio para auditoría.")
             return
-        edited_df = ensure_columns(pd.DataFrame(edited), sheet)
-        storage.save(sheet, edited_df)
+        new_df = df.copy()
+        mask = new_df[id_col].astype(str) == registro_id
+        if not mask.any():
+            st.error("No se encontró el registro seleccionado.")
+            return
+
+        audit_rows = []
+        action = "EDITAR_REGISTRO"
+        if save_btn:
+            for col, new_value in values.items():
+                old_value = clean_str(new_df.loc[mask, col].iloc[0]) if col in new_df.columns else ""
+                new_text = clean_str(new_value)
+                if old_value != new_text:
+                    new_df.loc[mask, col] = new_value
+                    audit_rows.append({
+                        "auditoria_id": f"AUD-{uuid.uuid4().hex[:12].upper()}",
+                        "fecha_evento": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "usuario": current_username(),
+                        "rol": current_role(),
+                        "accion": action,
+                        "modulo": sheet,
+                        "registro_id": registro_id,
+                        "campo": col,
+                        "valor_anterior": old_value,
+                        "valor_nuevo": new_text,
+                        "motivo": motivo,
+                        "detalle": f"Edición de {title}",
+                    })
+        elif deactivate_btn:
+            action = "DESACTIVAR_REGISTRO"
+            if "activo" in new_df.columns:
+                old_value = clean_str(new_df.loc[mask, "activo"].iloc[0])
+                new_df.loc[mask, "activo"] = "No"
+                audit_rows.append({"auditoria_id": f"AUD-{uuid.uuid4().hex[:12].upper()}", "fecha_evento": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"), "usuario": current_username(), "rol": current_role(), "accion": action, "modulo": sheet, "registro_id": registro_id, "campo": "activo", "valor_anterior": old_value, "valor_nuevo": "No", "motivo": motivo, "detalle": f"Desactivación lógica de {title}"})
+            if "estado_registro" in new_df.columns:
+                old_value = clean_str(new_df.loc[mask, "estado_registro"].iloc[0])
+                new_df.loc[mask, "estado_registro"] = "Inactivo"
+                audit_rows.append({"auditoria_id": f"AUD-{uuid.uuid4().hex[:12].upper()}", "fecha_evento": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"), "usuario": current_username(), "rol": current_role(), "accion": action, "modulo": sheet, "registro_id": registro_id, "campo": "estado_registro", "valor_anterior": old_value, "valor_nuevo": "Inactivo", "motivo": motivo, "detalle": f"Desactivación lógica de {title}"})
+        elif reactivate_btn:
+            action = "REACTIVAR_REGISTRO"
+            if "activo" in new_df.columns:
+                old_value = clean_str(new_df.loc[mask, "activo"].iloc[0])
+                new_df.loc[mask, "activo"] = "Sí"
+                audit_rows.append({"auditoria_id": f"AUD-{uuid.uuid4().hex[:12].upper()}", "fecha_evento": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"), "usuario": current_username(), "rol": current_role(), "accion": action, "modulo": sheet, "registro_id": registro_id, "campo": "activo", "valor_anterior": old_value, "valor_nuevo": "Sí", "motivo": motivo, "detalle": f"Reactivación de {title}"})
+            if "estado_registro" in new_df.columns:
+                old_value = clean_str(new_df.loc[mask, "estado_registro"].iloc[0])
+                new_df.loc[mask, "estado_registro"] = "Activo"
+                audit_rows.append({"auditoria_id": f"AUD-{uuid.uuid4().hex[:12].upper()}", "fecha_evento": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"), "usuario": current_username(), "rol": current_role(), "accion": action, "modulo": sheet, "registro_id": registro_id, "campo": "estado_registro", "valor_anterior": old_value, "valor_nuevo": "Activo", "motivo": motivo, "detalle": f"Reactivación de {title}"})
+
+        if "modificado_por" in new_df.columns:
+            new_df.loc[mask, "modificado_por"] = current_username()
+        if "fecha_modificacion" in new_df.columns:
+            new_df.loc[mask, "fecha_modificacion"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+        if "motivo_modificacion" in new_df.columns:
+            new_df.loc[mask, "motivo_modificacion"] = motivo
+
+        storage.save(sheet, ensure_columns(new_df, sheet))
+        append_audit_rows(storage, audit_rows)
         if sheet == "Productos":
             sync_data = dict(data)
-            sync_data["Productos"] = edited_df
+            sync_data["Productos"] = ensure_columns(new_df, sheet)
             try:
                 sync_kardex_consolidado_sheet(storage, sync_data)
-                set_flash(f"{title} actualizado correctamente. Kardex consolidado sincronizado.")
-            except Exception as exc:
-                set_flash(f"{title} actualizado, pero no se pudo sincronizar Kardex_Consolidado: {exc}", "warning")
-        else:
-            set_flash(f"{title} actualizado correctamente.")
+            except Exception:
+                pass
+        set_flash(f"{title}: cambio guardado correctamente con auditoría.")
         rerun()
-
 
 def page_catalogos(storage, data: Dict[str, pd.DataFrame]) -> None:
     section_header("⚙️ Catálogos", "Formularios independientes para mantener ordenados productos, proveedores, solicitantes y personal.")
@@ -3253,20 +3608,28 @@ def page_catalogos(storage, data: Dict[str, pd.DataFrame]) -> None:
     tab_prod, tab_prov, tab_sol, tab_per = st.tabs(["📦 Productos", "🚚 Proveedores", "🏥 Solicitantes", "👤 Personal"])
 
     with tab_prod:
-        if st.session_state.get("rol") != "Consulta":
+        if user_has_permission(data, "crear_productos"):
             product_form(storage, data)
+        else:
+            st.info("Puede consultar productos. Para crear productos solicite permiso al administrador.")
         catalog_editor(storage, data, "Productos", "Listado de productos")
     with tab_prov:
-        if st.session_state.get("rol") != "Consulta":
+        if user_has_permission(data, "crear_proveedores"):
             provider_form(storage, data)
+        else:
+            st.info("Puede consultar proveedores. Para crear proveedores solicite permiso al administrador.")
         catalog_editor(storage, data, "Proveedores", "Listado de proveedores")
     with tab_sol:
-        if st.session_state.get("rol") != "Consulta":
+        if user_has_permission(data, "crear_solicitantes"):
             requester_form(storage, data)
+        else:
+            st.info("Puede consultar solicitantes. Para crear solicitantes solicite permiso al administrador.")
         catalog_editor(storage, data, "Solicitantes", "Listado de solicitantes")
     with tab_per:
-        if st.session_state.get("rol") != "Consulta":
+        if user_has_permission(data, "crear_personal"):
             staff_form(storage, data)
+        else:
+            st.info("Puede consultar personal. Para crear personal solicite permiso al administrador.")
         catalog_editor(storage, data, "Personal", "Listado de personal")
 
 
@@ -3303,12 +3666,176 @@ def page_importar(storage, data: Dict[str, pd.DataFrame]) -> None:
             st.error(f"No se pudo importar el archivo. Revise que tenga la hoja MOVIMIENTO con la estructura esperada. Detalle: {exc}")
 
 
+
+# ------------------------- GESTIÓN CONTROLADA Y AUDITORÍA -------------------------
+def render_movement_crud_controls(storage, data: Dict[str, pd.DataFrame]) -> None:
+    """Permite anular movimientos y editar datos administrativos con permisos.
+
+    No se eliminan filas. La anulación cambia estado_movimiento a Anulado y el stock se recalcula
+    excluyendo ese movimiento. Esto conserva trazabilidad completa.
+    """
+    section_header("🧾 Gestión controlada de movimientos", "Anulación lógica y edición administrativa con motivo obligatorio y auditoría.")
+    movimientos = ensure_columns(data.get("Movimientos", pd.DataFrame()), "Movimientos")
+    if movimientos.empty:
+        st.info("No hay movimientos registrados.")
+        return
+
+    view = movimientos.copy()
+    view["cantidad_num"] = to_number(view["cantidad"])
+    card_start("Movimientos registrados", "Seleccione un movimiento. Los movimientos anulados no afectan el stock.")
+    filtro_estado = st.multiselect("Estado movimiento", sorted(view["estado_movimiento"].dropna().astype(str).unique().tolist()), default=sorted(view["estado_movimiento"].dropna().astype(str).unique().tolist()))
+    filtro_producto = st.text_input("Buscar producto/lote/movimiento", key="buscar_mov_crud")
+    show = view.copy()
+    if filtro_estado:
+        show = show[show["estado_movimiento"].isin(filtro_estado)]
+    if filtro_producto:
+        show = show[show.astype(str).apply(lambda col: col.str.contains(filtro_producto, case=False, na=False)).any(axis=1)]
+    st.dataframe(show[["movimiento_id", "fecha", "tipo_movimiento", "producto", "marca", "lote", "solicitante", "proveedor", "cantidad", "unidad", "estado_movimiento", "usuario_registro", "fecha_registro", "motivo_anulacion"]], use_container_width=True, hide_index=True)
+
+    labels = movimientos.apply(lambda r: f"{clean_str(r['movimiento_id'])} | {clean_str(r['fecha'])} | {clean_str(r['tipo_movimiento'])} | {clean_str(r['producto'])} | Lote {clean_str(r['lote'])} | Cant. {clean_str(r['cantidad'])} | Estado {clean_str(r.get('estado_movimiento', 'Vigente'))}", axis=1).tolist()
+    selected_label = st.selectbox("Seleccionar movimiento", labels, key="sel_mov_crud")
+    selected_idx = labels.index(selected_label)
+    selected = movimientos.iloc[selected_idx].copy()
+    mov_id = clean_str(selected.get("movimiento_id", ""))
+
+    tab_anular, tab_editar = st.tabs(["Anular movimiento", "Editar datos administrativos"])
+    with tab_anular:
+        if not user_has_permission(data, "anular_movimientos"):
+            st.info("No tiene permiso para anular movimientos. Solicítelo al administrador.")
+        elif clean_str(selected.get("estado_movimiento", "Vigente")).lower() == "anulado":
+            st.warning("Este movimiento ya está anulado.")
+        else:
+            with st.form(f"frm_anular_{mov_id}"):
+                st.markdown(f"**Movimiento:** {mov_id}")
+                motivo = st.text_area("Motivo de anulación *", placeholder="Ejemplo: error de digitación, salida duplicada, ingreso registrado en lote incorrecto.")
+                confirmar = st.checkbox("Confirmo que deseo anular este movimiento. No se eliminará; quedará en auditoría.")
+                submitted = st.form_submit_button("🚫 Anular movimiento", use_container_width=True)
+            if submitted:
+                if not motivo or not confirmar:
+                    st.error("Debe ingresar motivo y confirmar la anulación.")
+                    return
+                new_df = movimientos.copy()
+                mask = new_df["movimiento_id"].astype(str) == mov_id
+                new_df.loc[mask, "estado_movimiento"] = "Anulado"
+                new_df.loc[mask, "anulado_por"] = current_username()
+                new_df.loc[mask, "fecha_anulacion"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+                new_df.loc[mask, "motivo_anulacion"] = motivo
+                storage.save("Movimientos", ensure_columns(new_df, "Movimientos"))
+                append_audit(storage, "ANULAR_MOVIMIENTO", "Movimientos", mov_id, "estado_movimiento", "Vigente", "Anulado", motivo, f"Anulación lógica de movimiento {mov_id}")
+                sync_data = dict(data)
+                sync_data["Movimientos"] = ensure_columns(new_df, "Movimientos")
+                try:
+                    sync_kardex_consolidado_sheet(storage, sync_data)
+                except Exception:
+                    pass
+                set_flash("Movimiento anulado correctamente. El stock y Kardex consolidado fueron recalculados.")
+                rerun()
+
+    with tab_editar:
+        if not user_has_permission(data, "editar_movimientos"):
+            st.info("No tiene permiso para editar movimientos. Solicítelo al administrador.")
+        else:
+            st.caption("Solo edite datos administrativos. Para cambios de cantidad o tipo de movimiento, use Corrección o Anulación para conservar trazabilidad.")
+            with st.form(f"frm_editar_mov_{mov_id}"):
+                c1, c2 = st.columns(2)
+                nueva_fecha = c1.text_input("Fecha", value=clean_str(selected.get("fecha", "")))
+                nuevo_personal = c2.text_input("Personal", value=clean_str(selected.get("personal", "")))
+                nuevo_proveedor = c1.text_input("Proveedor", value=clean_str(selected.get("proveedor", "")))
+                nuevo_solicitante = c2.text_input("Solicitante / destino", value=clean_str(selected.get("solicitante", "")))
+                nueva_oc = c1.text_input("Orden de compra", value=clean_str(selected.get("orden_compra", "")))
+                nueva_obs = st.text_area("Observación", value=clean_str(selected.get("observacion", "")))
+                motivo = st.text_area("Motivo de modificación *")
+                submitted = st.form_submit_button("💾 Guardar edición administrativa", use_container_width=True)
+            if submitted:
+                if not motivo:
+                    st.error("Debe ingresar el motivo de modificación.")
+                    return
+                new_values = {"fecha": nueva_fecha, "personal": nuevo_personal, "proveedor": nuevo_proveedor, "solicitante": nuevo_solicitante, "orden_compra": nueva_oc, "observacion": nueva_obs}
+                new_df = movimientos.copy()
+                mask = new_df["movimiento_id"].astype(str) == mov_id
+                audit_rows = []
+                for col, val in new_values.items():
+                    old = clean_str(new_df.loc[mask, col].iloc[0])
+                    new = clean_str(val)
+                    if old != new:
+                        new_df.loc[mask, col] = val
+                        audit_rows.append({"auditoria_id": f"AUD-{uuid.uuid4().hex[:12].upper()}", "fecha_evento": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"), "usuario": current_username(), "rol": current_role(), "accion": "EDITAR_MOVIMIENTO", "modulo": "Movimientos", "registro_id": mov_id, "campo": col, "valor_anterior": old, "valor_nuevo": new, "motivo": motivo, "detalle": "Edición administrativa de movimiento"})
+                new_df.loc[mask, "modificado_por"] = current_username()
+                new_df.loc[mask, "fecha_modificacion"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+                new_df.loc[mask, "motivo_modificacion"] = motivo
+                storage.save("Movimientos", ensure_columns(new_df, "Movimientos"))
+                append_audit_rows(storage, audit_rows)
+                set_flash("Movimiento actualizado correctamente con auditoría.")
+                rerun()
+
+
+def admin_permissions_tab(storage, data: Dict[str, pd.DataFrame]) -> None:
+    card_start("Permisos especiales por usuario", "Active o niegue permisos específicos sin cambiar el rol general.")
+    usuarios = ensure_columns(data.get("Usuarios", pd.DataFrame()), "Usuarios")
+    permisos = ensure_columns(data.get("Permisos_Usuarios", pd.DataFrame()), "Permisos_Usuarios")
+    usuarios_activos = usuarios[active_mask(usuarios)].copy()
+    if usuarios_activos.empty:
+        st.info("No hay usuarios activos.")
+        return
+    user_labels = usuarios_activos.apply(lambda r: f"{clean_str(r['usuario'])} | {clean_str(r['nombre'])} | Rol: {clean_str(r['rol'])}", axis=1).tolist()
+    selected_label = st.selectbox("Usuario", user_labels, key="perm_user")
+    selected_user = clean_str(usuarios_activos.iloc[user_labels.index(selected_label)]["usuario"])
+    current = permisos[(permisos["usuario"].astype(str).str.lower().str.strip() == selected_user.lower()) & (permisos["estado"].astype(str).str.lower().str.strip().isin(["activo", "sí", "si", "true", "1", ""]))]
+    current_yes = set(current[current["valor"].astype(str).str.lower().str.strip().isin(["sí", "si", "true", "1", "yes"])] ["permiso"].astype(str).tolist())
+    options = list(PERMISSION_LABELS.keys())
+    selected_perms = st.multiselect(
+        "Permisos habilitados para este usuario",
+        options,
+        default=[p for p in options if p in current_yes],
+        format_func=lambda p: PERMISSION_LABELS.get(p, p),
+    )
+    st.caption("Los permisos seleccionados se guardan como excepciones explícitas. Si desmarca un permiso, quedará negado para ese usuario.")
+    if st.button("💾 Guardar permisos del usuario", use_container_width=True):
+        now = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+        remaining = permisos[permisos["usuario"].astype(str).str.lower().str.strip() != selected_user.lower()].copy()
+        rows = []
+        for perm in options:
+            rows.append({
+                "usuario": selected_user,
+                "permiso": perm,
+                "valor": "Sí" if perm in selected_perms else "No",
+                "fecha_asignacion": now,
+                "asignado_por": current_username(),
+                "estado": "Activo",
+            })
+        new_df = pd.concat([remaining, pd.DataFrame(rows)], ignore_index=True)
+        storage.save("Permisos_Usuarios", ensure_columns(new_df, "Permisos_Usuarios"))
+        append_audit(storage, "ASIGNAR_PERMISOS", "Permisos_Usuarios", selected_user, "permisos", ", ".join(sorted(current_yes)), ", ".join(sorted(selected_perms)), "Asignación desde administración", f"Permisos actualizados para {selected_user}")
+        set_flash("Permisos actualizados correctamente.")
+        rerun()
+    st.dataframe(permisos, use_container_width=True, hide_index=True)
+
+
+def admin_audit_tab(data: Dict[str, pd.DataFrame]) -> None:
+    card_start("Auditoría del sistema", "Registro de creación, edición, anulación y cambios de permisos.")
+    aud = ensure_columns(data.get("Auditoria_Cambios", pd.DataFrame()), "Auditoria_Cambios")
+    if aud.empty:
+        st.info("Aún no hay eventos de auditoría registrados.")
+        return
+    c1, c2, c3 = st.columns(3)
+    accion = c1.multiselect("Acción", sorted(aud["accion"].dropna().astype(str).unique().tolist()))
+    usuario = c2.multiselect("Usuario", sorted(aud["usuario"].dropna().astype(str).unique().tolist()))
+    modulo = c3.multiselect("Módulo", sorted(aud["modulo"].dropna().astype(str).unique().tolist()))
+    view = aud.copy()
+    if accion:
+        view = view[view["accion"].isin(accion)]
+    if usuario:
+        view = view[view["usuario"].isin(usuario)]
+    if modulo:
+        view = view[view["modulo"].isin(modulo)]
+    st.dataframe(view.sort_values("fecha_evento", ascending=False), use_container_width=True, hide_index=True)
+
 def page_admin(storage, data: Dict[str, pd.DataFrame], mode: str) -> None:
     section_header("🔐 Administración", "Gestión de usuarios, seguridad PATH automática y diagnóstico de conexión a la base.")
     if not require_admin():
         return
 
-    tab1, tab2, tab3 = st.tabs(["Usuarios", "Seguridad PATH", "Diagnóstico"])
+    tab1, tab_perm, tab_crud, tab_audit, tab2, tab3 = st.tabs(["Usuarios", "Permisos", "Movimientos", "Auditoría", "Seguridad PATH", "Diagnóstico"])
 
     with tab1:
         card_start("Crear usuario", "Asigne rol y credenciales de acceso.")
@@ -3351,6 +3878,15 @@ def page_admin(storage, data: Dict[str, pd.DataFrame], mode: str) -> None:
             users_view["password_hash"] = users_view["password_hash"].astype(str).str[:10] + "..."
             users_view["path_verificacion"] = "Automático"
         st.dataframe(users_view, use_container_width=True, hide_index=True)
+
+    with tab_perm:
+        admin_permissions_tab(storage, data)
+
+    with tab_crud:
+        render_movement_crud_controls(storage, data)
+
+    with tab_audit:
+        admin_audit_tab(data)
 
     with tab2:
         card_start("PATH automático temporal", "El sistema genera un código PATH visible en la pantalla de login. El usuario lo copia y lo pega para completar el acceso.")

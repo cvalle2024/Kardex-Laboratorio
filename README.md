@@ -307,3 +307,15 @@ El módulo de salidas solo muestra productos con saldo disponible calculado desd
 ## V22 - Logo PNG en acta PDF
 
 El acta de entrega usa `assets/logo_vihca.png` como logo oficial. También se incluye respaldo embebido para evitar problemas de rutas en Streamlit Cloud.
+
+## Actualización V24 - CRUD, permisos y auditoría
+
+La V24 agrega gestión profesional de catálogos y movimientos:
+
+- CRUD controlado en catálogos.
+- Permisos especiales por usuario desde Administración.
+- Anulación lógica de movimientos en lugar de eliminación física.
+- Auditoría completa de cambios.
+- Nuevas hojas en la base: `Permisos_Usuarios` y `Auditoria_Cambios`.
+
+Regla clave: los movimientos del Kardex no se eliminan; se anulan o corrigen para conservar trazabilidad.
