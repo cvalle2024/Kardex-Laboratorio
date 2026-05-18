@@ -324,8 +324,3 @@ Regla clave: los movimientos del Kardex no se eliminan; se anulan o corrigen par
 ## V25 - Corrección de estructura Google Sheets
 
 Esta versión agrega migración automática para crear las hojas nuevas `Permisos_Usuarios` y `Auditoria_Cambios` si la base fue creada con una versión anterior. Se recomienda tener en Secrets: `AUTO_MIGRATE_GOOGLE_SHEETS = true`.
-
-
-## Versión V26 — Arquitectura modular profesional
-
-Esta versión reorganiza el sistema para que deje de depender de un único script largo. El archivo `app.py` queda como punto de entrada y la lógica se separa en módulos: configuración, utilidades, almacenamiento, servicios de Kardex, reportes, autenticación, componentes UI y páginas. Consulte `ARCHITECTURE.md` para el detalle técnico.
