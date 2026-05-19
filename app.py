@@ -2514,7 +2514,7 @@ def build_acta_entrega_pdf(
         [Paragraph("<b>Entregué conforme</b>", small_center), Paragraph("<b>Recibí conforme</b>", small_center)],
         [Paragraph(f"<b>{entrega_nombre}</b>", small_center), Paragraph(f"<b>{recibe_nombre}</b>", small_center)],
         [Paragraph(entrega_cargo, small_center), Paragraph(recibe_cargo, small_center)],
-        [Paragraph("Programa Regional Centroamericano de VIH<br/>Asociado al Centro de Estudios en Salud, de la<br/>Universidad del Valle de Guatemala", small_center), Paragraph(sitio, small_center)],
+        [Paragraph("Programa VIHCA<br/>Asociado al Centro de Estudios en Salud, de la<br/>Universidad del Valle de Guatemala", small_center), Paragraph(sitio, small_center)],
     ], colWidths=[3.25 * inch, 3.25 * inch])
     firma_table.setStyle(TableStyle([
         ("ALIGN", (0, 0), (-1, -1), "CENTER"),
