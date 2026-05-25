@@ -3160,19 +3160,106 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             )
 
         mov_nonce = int(st.session_state.get("mov_form_nonce", 0))
+
+        # ── Paso 3: selección de sitio FUERA del form para auto-relleno ──────
+        st.markdown("<div class='form-card'>", unsafe_allow_html=True)
+        st.markdown(
+            "<div class='step-title'><span class='step-badge'>3</span>Sitio receptor y datos de entrega</div><hr class='step-divider'>",
+            unsafe_allow_html=True,
+        )
+
+        # Fecha del acta: por defecto es hoy, pero el usuario puede cambiarla
+        fecha_col, _ = st.columns([1, 2])
+        fecha_acta = fecha_col.date_input(
+            "📅 Fecha del acta de entrega",
+            value=pd.Timestamp.now().date(),
+            help="Se usa en el acta PDF y en el registro del movimiento. Por defecto es la fecha actual, puede cambiarla si es necesario.",
+            key=f"fecha_acta_salida_{mov_nonce}",
+        )
+        fecha = pd.Timestamp(fecha_acta)  # convertir a Timestamp para compatibilidad
+
+        # Selector de sitio fuera del form → rerun inmediato al cambiar
+        col_solic, col_pers = st.columns(2)
+        solicitante = col_solic.selectbox(
+            "Sitio / unidad solicitante *",
+            [""] + solicitantes[active_mask(solicitantes)]["unidad_solicitante"].dropna().astype(str).sort_values().tolist(),
+            key=f"sel_solic_salida_{mov_nonce}",
+            help="Al seleccionar el sitio se cargan automáticamente el encargado y su cargo.",
+        )
+
+        # Buscar info del solicitante en la base
+        solicitante_info   = get_first_match(solicitantes, "unidad_solicitante", solicitante) if solicitante else {}
+        responsable_auto   = clean_str(solicitante_info.get("responsable", "")) if solicitante_info else ""
+        dpto_auto          = clean_str(solicitante_info.get("departamento", "")) if solicitante_info else ""
+        tel_auto           = clean_str(solicitante_info.get("telefono", ""))     if solicitante_info else ""
+
+        # Buscar cargo del responsable en la tabla Personal
+        personal_resp_row  = get_first_match(personal_df, "nombre", responsable_auto) if responsable_auto else {}
+        cargo_auto         = clean_str(personal_resp_row.get("cargo", "")) if personal_resp_row else ""
+        if not cargo_auto:
+            cargo_auto = "Responsable del sitio"
+
+        # Mostrar tarjeta del encargado si ya seleccionó un sitio
+        if solicitante and responsable_auto:
+            st.markdown(
+                f"""<div style="border:1px solid rgba(56,189,248,.25); border-radius:14px; padding:12px 16px;
+                                margin:4px 0 12px 0; background:rgba(56,189,248,.06); display:flex; gap:16px; flex-wrap:wrap;">
+                    <div style="font-size:13px;">
+                        <span style="color:#64748B; font-size:11px; text-transform:uppercase; letter-spacing:.06em;">Encargado del sitio</span><br>
+                        <b style="color:#F8FAFC; font-size:15px;">👤 {responsable_auto}</b>
+                    </div>
+                    <div style="font-size:13px;">
+                        <span style="color:#64748B; font-size:11px; text-transform:uppercase; letter-spacing:.06em;">Cargo</span><br>
+                        <b style="color:#CBD5E1;">{cargo_auto}</b>
+                    </div>
+                    {"" if not dpto_auto else f'<div style="font-size:13px;"><span style="color:#64748B; font-size:11px; text-transform:uppercase; letter-spacing:.06em;">Departamento</span><br><b style="color:#CBD5E1;">{dpto_auto}</b></div>'}
+                    {"" if not tel_auto else f'<div style="font-size:13px;"><span style="color:#64748B; font-size:11px; text-transform:uppercase; letter-spacing:.06em;">Teléfono</span><br><b style="color:#CBD5E1;">{tel_auto}</b></div>'}
+                </div>""",
+                unsafe_allow_html=True,
+            )
+        elif solicitante and not responsable_auto:
+            st.markdown(
+                "<div class='alert-orange'>⚠️ Este sitio no tiene un encargado registrado. "
+                "Puede agregarlo en el catálogo de Solicitantes y el campo se llenará automáticamente.</div>",
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        # ── Formulario principal de salida ────────────────────────────────────
         st.markdown("<div class='form-card'>", unsafe_allow_html=True)
         with st.form(f"frm_confirmar_salida_{mov_nonce}", clear_on_submit=True):
-            st.markdown("#### 3) Datos de entrega / sitio receptor")
-            a, b, c = st.columns(3)
-            fecha = a.date_input("Fecha de salida", value=TODAY.date())
-            usuario = b.text_input("Usuario que registra", value=st.session_state.get("nombre_usuario", "Usuario"))
-            solicitante = c.selectbox("Sitio / unidad solicitante *", [""] + solicitantes["unidad_solicitante"].dropna().astype(str).sort_values().tolist())
-            solicitante_info = get_first_match(solicitantes, "unidad_solicitante", solicitante)
-            d, e, f = st.columns(3)
-            personal = d.selectbox("Personal que entrega *", [""] + personal_df["nombre"].dropna().astype(str).sort_values().tolist())
-            recibe_default = clean_str(solicitante_info.get("responsable", "")) if solicitante_info else ""
-            recibe_nombre = e.text_input("Persona que recibe / firma", value=recibe_default)
-            recibe_cargo = f.text_input("Cargo de quien recibe", value="Responsable del sitio")
+            st.markdown(
+                "<div class='step-title'><span class='step-badge'>4</span>Datos de entrega y observaciones</div><hr class='step-divider'>",
+                unsafe_allow_html=True,
+            )
+            d1, d2 = st.columns(2)
+            usuario  = d1.text_input("Registrado por", value=st.session_state.get("nombre_usuario", "Usuario"))
+            personal = d2.selectbox(
+                "Personal que entrega *",
+                [""] + personal_df[active_mask(personal_df)]["nombre"].dropna().astype(str).sort_values().tolist(),
+            )
+
+            # Campos de receptor: pre-rellenos y bloqueados desde la base de datos
+            st.markdown("<hr class='step-divider'>", unsafe_allow_html=True)
+            st.markdown(
+                "<span style='font-size:12px; color:#64748B;'>Los siguientes campos se rellenan automáticamente "
+                "desde el catálogo del sitio receptor y no son editables.</span>",
+                unsafe_allow_html=True,
+            )
+            r1, r2 = st.columns(2)
+            recibe_nombre = r1.text_input(
+                "Persona que recibe (del catálogo)",
+                value=responsable_auto,
+                disabled=True,
+                help="Se obtiene automáticamente del responsable registrado para este sitio.",
+            )
+            recibe_cargo  = r2.text_input(
+                "Cargo",
+                value=cargo_auto,
+                disabled=True,
+                help="Se obtiene del cargo registrado en Personal para este responsable.",
+            )
             observacion = st.text_area("Observación para movimientos y acta", placeholder="Detalle de solicitud, referencia o comentario de entrega.")
             tipo_entrega_auto = acta_tipo_entrega_desde_categorias(cart)
             tipo_entrega_texto = st.text_input(
@@ -3232,13 +3319,14 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
                 if qty_same > float(item.get("stock_disponible", 0) or 0):
                     st.error(f"La cantidad del lote {item.get('lote')} supera el stock disponible.")
                     return
-            acta_id = f"ACTA-{pd.Timestamp.now().strftime('%Y%m%d%H%M%S')}"
+            fecha_ts   = pd.Timestamp.now()   # timestamp del momento exacto de guardado (para el ID del acta)
+            acta_id    = f"ACTA-{fecha_ts.strftime('%Y%m%d%H%M%S')}"
             ids = next_movement_ids(movimientos, len(cart))
             rows = []
             for mov_id, item in zip(ids, cart):
                 rows.append({
                     "movimiento_id": mov_id,
-                    "fecha": pd.to_datetime(fecha).strftime("%Y-%m-%d"),
+                    "fecha": fecha.strftime("%Y-%m-%d"),  # fecha seleccionada por el usuario en el acta
                     "tipo_movimiento": "Salida",
                     "producto_id": item["producto_id"],
                     "producto": item["producto"],
