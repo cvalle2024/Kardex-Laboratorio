@@ -315,34 +315,104 @@ def rerun() -> None:
 
 
 def set_flash(message: str, level: str = "success") -> None:
-    """Guarda un mensaje temporal para mostrarlo después del rerun.
-
-    Streamlit vuelve a ejecutar la app después de guardar; si usamos st.success()
-    antes del rerun, el usuario casi no alcanza a ver la confirmación.
-    Este helper conserva el mensaje y lo muestra una vez en la siguiente carga.
-    """
+    """Guarda un mensaje para mostrarlo como toast animado tras el rerun."""
     st.session_state["flash_message"] = {"level": level, "message": message}
 
 
 def show_flash() -> None:
+    """Muestra el mensaje pendiente como toast animado en esquina superior derecha."""
     flash = st.session_state.pop("flash_message", None)
     if not flash:
         return
-    level = flash.get("level", "success")
+    level   = flash.get("level", "success")
     message = flash.get("message", "")
-    if level == "success":
-        st.success(message, icon="✅")
-    elif level == "warning":
-        st.warning(message, icon="⚠️")
-    elif level == "error":
-        st.error(message, icon="🚫")
-    else:
-        st.info(message, icon="ℹ️")
+    icons   = {"success": "✅", "warning": "⚠️", "error": "❌", "info": "ℹ️"}
+    icon    = icons.get(level, "ℹ️")
+    _id     = f"toast_{level}_{hash(message) & 0xFFFF}"
+    st.markdown(
+        f"""
+        <div id="{_id}" class="toast toast-{level}" style="position:fixed;">
+            <span class="toast-icon">{icon}</span>
+            <div style="flex:1;">{message}</div>
+            <div class="toast-progress"></div>
+        </div>
+        <script>
+        (function(){{
+            var el = document.getElementById('{_id}');
+            if(!el) return;
+            setTimeout(function(){{
+                el.style.animation = 'toastOut .4s ease forwards';
+                setTimeout(function(){{ el.remove(); }}, 400);
+            }}, 4200);
+        }})();
+        </script>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def bump_form_nonce(name: str) -> None:
     """Cambia la clave de un formulario para limpiar textboxes tras guardar."""
     st.session_state[name] = int(st.session_state.get(name, 0)) + 1
+
+
+def confirm_pending(key: str) -> bool:
+    """Returns True if a confirmation is pending for the given key."""
+    return st.session_state.get(f"_confirm_pending_{key}", False)
+
+
+def set_confirm_pending(key: str, payload: dict | None = None) -> None:
+    """Mark an action as pending confirmation with optional payload data."""
+    st.session_state[f"_confirm_pending_{key}"] = True
+    st.session_state[f"_confirm_payload_{key}"] = payload or {}
+
+
+def clear_confirm(key: str) -> None:
+    """Clear the confirmation state."""
+    st.session_state.pop(f"_confirm_pending_{key}", None)
+    st.session_state.pop(f"_confirm_payload_{key}", None)
+
+
+def get_confirm_payload(key: str) -> dict:
+    """Get the payload stored for a pending confirmation."""
+    return st.session_state.get(f"_confirm_payload_{key}", {})
+
+
+def render_confirm_box(
+    key: str,
+    title: str,
+    body: str,
+    confirm_label: str = "✅ Confirmar",
+    cancel_label: str  = "✖ Cancelar",
+    danger: bool = True,
+) -> bool:
+    """Show an inline confirmation card. Returns True when user confirms."""
+    accent   = "#EF4444" if danger else "#38BDF8"
+    icon     = "⚠️" if danger else "❓"
+    confirmed = False
+    st.markdown(
+        f"""
+        <div style="border:1.5px solid {accent}55; border-radius:18px; padding:22px 24px; margin:12px 0;
+                    background:linear-gradient(160deg,rgba(15,23,42,.96),rgba(3,7,18,.92));
+                    box-shadow:0 16px 50px rgba(0,0,0,.40); animation:slideUp .22s ease;">
+            <div style="font-size:18px; font-weight:900; color:#F8FAFC; margin-bottom:10px;">
+                {icon} {title}
+            </div>
+            <div style="font-size:13.5px; color:#94A3B8; line-height:1.65; margin-bottom:18px;">
+                {body}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    c1, c2 = st.columns(2)
+    if c1.button(confirm_label, key=f"_confirm_yes_{key}", use_container_width=True, type="primary"):
+        clear_confirm(key)
+        confirmed = True
+    if c2.button(cancel_label, key=f"_confirm_no_{key}", use_container_width=True):
+        clear_confirm(key)
+        st.rerun()
+    return confirmed
 
 
 def clean_str(value) -> str:
@@ -1654,58 +1724,186 @@ def apply_theme() -> None:
     st.markdown(
         """
         <style>
+        /* ── Variables ──────────────────────────────────────────────── */
         :root{
-            --bg:#050816; --panel:#0B1020; --panel2:#111827; --line:rgba(148,163,184,.22);
-            --text:#E5E7EB; --muted:#94A3B8; --cyan:#38BDF8; --green:#22C55E; --orange:#F97316; --red:#EF4444;
-            --purple:#8B5CF6; --blue:#2563EB;
+            --bg:#050816; --panel:#0B1020; --panel2:#0F172A; --line:rgba(148,163,184,.18);
+            --text:#E5E7EB; --muted:#94A3B8; --dim:#64748B;
+            --cyan:#38BDF8; --green:#22C55E; --orange:#F97316; --red:#EF4444;
+            --purple:#8B5CF6; --blue:#3B82F6; --yellow:#EAB308;
+            --radius-sm:10px; --radius-md:16px; --radius-lg:22px; --radius-xl:28px;
+            --shadow-sm:0 4px 14px rgba(0,0,0,.20);
+            --shadow-md:0 12px 32px rgba(0,0,0,.28);
+            --shadow-lg:0 20px 50px rgba(0,0,0,.35);
         }
+        /* ── Base ───────────────────────────────────────────────────── */
         .stApp{
-            background: radial-gradient(circle at top left, rgba(56,189,248,.12), transparent 28%),
-                        radial-gradient(circle at top right, rgba(139,92,246,.10), transparent 30%),
-                        linear-gradient(180deg, #030712 0%, #0B1020 55%, #030712 100%);
+            background: radial-gradient(ellipse 80% 50% at 10% 0%, rgba(56,189,248,.10) 0%, transparent 50%),
+                        radial-gradient(ellipse 60% 40% at 90% 0%, rgba(139,92,246,.08) 0%, transparent 50%),
+                        linear-gradient(180deg, #030712 0%, #0A0F1E 60%, #030712 100%);
         }
-        .block-container{padding-top:1rem; padding-bottom:2rem; max-width:1480px;}
-        section[data-testid="stSidebar"]{background:rgba(2,6,23,.96); border-right:1px solid rgba(148,163,184,.18);}
+        .block-container{padding-top:.75rem; padding-bottom:2.5rem; max-width:1500px;}
+        /* ── Sidebar ────────────────────────────────────────────────── */
+        section[data-testid="stSidebar"]{
+            background:linear-gradient(180deg, rgba(3,7,18,.98), rgba(10,15,30,.98));
+            border-right:1px solid var(--line);
+        }
+        section[data-testid="stSidebar"] .stRadio label{
+            border-radius:var(--radius-sm); padding:8px 10px; transition:background .15s; display:block;
+        }
+        /* ── Hero banner ────────────────────────────────────────────── */
         .hero{
-            background: radial-gradient(circle at top left, rgba(56,189,248,.28), transparent 32%),
-                        linear-gradient(135deg, #070B18 0%, #0F172A 62%, #111827 100%);
-            border:1px solid var(--line); border-radius:26px; padding:24px 26px; margin-bottom:18px;
-            box-shadow:0 18px 50px rgba(0,0,0,.25);
+            background: radial-gradient(ellipse 70% 80% at 0% 50%, rgba(56,189,248,.22) 0%, transparent 55%),
+                        linear-gradient(135deg, #07111F 0%, #0D1B2E 50%, #0F172A 100%);
+            border:1px solid rgba(56,189,248,.18); border-radius:var(--radius-xl);
+            padding:22px 28px; margin-bottom:20px; box-shadow:var(--shadow-md);
+            position:relative; overflow:hidden;
         }
-        .hero h1{font-size:34px; margin:0; color:white; letter-spacing:.3px;}
-        .hero p{margin:7px 0 0 0; color:var(--muted); font-size:14px;}
-        .section-title{font-size:24px; font-weight:900; color:#F8FAFC; margin:6px 0 4px 0;}
-        .section-subtitle{font-size:13px; color:#94A3B8; margin-bottom:16px;}
+        .hero::after{
+            content:""; position:absolute; top:-40px; right:-40px;
+            width:200px; height:200px; border-radius:50%;
+            background:radial-gradient(circle, rgba(139,92,246,.12), transparent 70%);
+        }
+        .hero h1{font-size:32px; margin:0; color:#F8FAFC; letter-spacing:.2px; font-weight:950;}
+        .hero p{margin:6px 0 0 0; color:var(--muted); font-size:13.5px; line-height:1.5;}
+        /* ── Section headers ────────────────────────────────────────── */
+        .section-title{
+            font-size:22px; font-weight:900; color:#F8FAFC; margin:4px 0 2px 0;
+            display:flex; align-items:center; gap:8px;
+        }
+        .section-subtitle{font-size:13px; color:#64748B; margin-bottom:18px; line-height:1.5;}
+        .section-divider{border:none; border-top:1px solid var(--line); margin:16px 0;}
+        /* ── Cards ──────────────────────────────────────────────────── */
+        .card{
+            border:1px solid var(--line); border-radius:var(--radius-lg);
+            padding:20px 22px; margin:0 0 16px 0;
+            background:linear-gradient(170deg, rgba(15,23,42,.88), rgba(5,10,24,.82));
+            box-shadow:var(--shadow-sm); transition:border-color .2s;
+        }
+        .card:hover{border-color:rgba(148,163,184,.30);}
+        .card-title{
+            font-size:15px; font-weight:800; color:#F8FAFC; margin-bottom:4px;
+            display:flex; align-items:center; gap:7px;
+        }
+        .card-sub{font-size:12px; color:var(--muted); margin-bottom:14px; line-height:1.4;}
+        /* ── Legacy form-card kept for compatibility ─────────────────── */
         .form-card{
-            border:1px solid rgba(148,163,184,.22); border-radius:22px; padding:18px 20px; margin:8px 0 18px 0;
-            background:linear-gradient(180deg, rgba(15,23,42,.82), rgba(2,6,23,.70)); box-shadow:0 14px 35px rgba(0,0,0,.20);
+            border:1px solid var(--line); border-radius:var(--radius-lg); padding:20px 22px;
+            margin:8px 0 18px 0; background:linear-gradient(170deg, rgba(15,23,42,.88), rgba(5,10,24,.82));
+            box-shadow:var(--shadow-sm);
         }
-        .mini-card{
-            border:1px solid rgba(148,163,184,.18); border-radius:18px; padding:14px 16px; margin-bottom:12px;
-            background:rgba(15,23,42,.60);
+        /* ── Step badges ────────────────────────────────────────────── */
+        .step-badge{
+            display:inline-flex; align-items:center; justify-content:center;
+            width:26px; height:26px; border-radius:50%; background:rgba(56,189,248,.18);
+            border:1.5px solid rgba(56,189,248,.45); color:#38BDF8;
+            font-size:12px; font-weight:900; margin-right:8px; flex-shrink:0;
         }
-        .mini-title{font-weight:800; color:#F8FAFC; font-size:15px; margin-bottom:2px;}
-        .mini-sub{color:#94A3B8; font-size:12px;}
+        .step-title{font-size:14px; font-weight:800; color:#E2E8F0; display:flex; align-items:center;}
+        .step-divider{border:none; border-top:1px solid rgba(148,163,184,.12); margin:14px 0 12px 0;}
+        /* ── KPI cards ──────────────────────────────────────────────── */
         .kpi-card{
-            border:1px solid var(--line); border-radius:20px; padding:17px 19px;
-            background:linear-gradient(180deg, rgba(15,23,42,.96), rgba(2,6,23,.94));
-            box-shadow:0 14px 35px rgba(0,0,0,.18); min-height:120px;
+            border:1px solid var(--line); border-radius:var(--radius-md); padding:16px 18px;
+            background:linear-gradient(160deg, rgba(15,23,42,.95), rgba(3,7,18,.90));
+            box-shadow:var(--shadow-sm); position:relative; overflow:hidden; min-height:110px;
         }
-        .kpi-label{color:#94A3B8; font-size:12px; text-transform:uppercase; letter-spacing:.08em;}
-        .kpi-value{color:#F8FAFC; font-size:32px; font-weight:900; margin-top:8px;}
-        .kpi-note{color:#CBD5E1; font-size:12px; margin-top:6px;}
-        .pill{display:inline-block; padding:5px 10px; border-radius:999px; background:rgba(56,189,248,.12); color:#BAE6FD; border:1px solid rgba(56,189,248,.22); font-size:12px; margin-right:6px;}
-        .alert-red{border-left:4px solid #EF4444; padding:12px 15px; background:rgba(239,68,68,.10); border-radius:14px; color:#FEE2E2;}
-        .alert-orange{border-left:4px solid #F97316; padding:12px 15px; background:rgba(249,115,22,.10); border-radius:14px; color:#FFEDD5;}
-        .alert-green{border-left:4px solid #22C55E; padding:12px 15px; background:rgba(34,197,94,.10); border-radius:14px; color:#DCFCE7;}
-        .login-wrap{max-width:540px; margin:7vh auto 0 auto;}
-        .login-card{border:1px solid rgba(148,163,184,.22); border-radius:28px; padding:28px; background:linear-gradient(180deg, rgba(15,23,42,.93), rgba(2,6,23,.88)); box-shadow:0 24px 70px rgba(0,0,0,.35);}
-        .login-title{font-size:31px; font-weight:950; color:#F8FAFC; margin:0;}
-        .login-sub{font-size:14px; color:#94A3B8; margin:6px 0 18px 0;}
-        .field-note{font-size:12px; color:#94A3B8; margin-top:-8px; margin-bottom:10px;}
-        div[data-testid="stMetricValue"]{font-size:28px;}
-        .stButton>button{border-radius:12px; font-weight:700;}
-        .stDownloadButton>button{border-radius:12px; font-weight:700;}
+        .kpi-accent{
+            position:absolute; top:0; right:0; width:50px; height:50px; border-radius:0 var(--radius-md) 0 50px;
+            opacity:.15;
+        }
+        .kpi-label{color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.10em; font-weight:600;}
+        .kpi-value{color:#F8FAFC; font-size:30px; font-weight:950; margin:8px 0 4px 0; line-height:1;}
+        .kpi-note{color:#CBD5E1; font-size:11.5px; line-height:1.4;}
+        .kpi-trend{font-size:11px; font-weight:700; margin-top:5px;}
+        /* ── Mini info card ─────────────────────────────────────────── */
+        .mini-card{
+            border:1px solid var(--line); border-radius:var(--radius-md); padding:13px 15px;
+            margin-bottom:12px; background:rgba(15,23,42,.60);
+        }
+        .mini-title{font-weight:800; color:#F8FAFC; font-size:14.5px; margin-bottom:2px;}
+        .mini-sub{color:var(--muted); font-size:12px;}
+        /* ── Alerts ─────────────────────────────────────────────────── */
+        .alert{border-radius:var(--radius-sm); padding:12px 16px; margin:8px 0; font-size:13px; line-height:1.5;}
+        .alert-red{border-left:3px solid var(--red); background:rgba(239,68,68,.10); color:#FEE2E2;}
+        .alert-orange{border-left:3px solid var(--orange); background:rgba(249,115,22,.10); color:#FFEDD5;}
+        .alert-green{border-left:3px solid var(--green); background:rgba(34,197,94,.10); color:#DCFCE7;}
+        .alert-blue{border-left:3px solid var(--cyan); background:rgba(56,189,248,.10); color:#BAE6FD;}
+        .alert-purple{border-left:3px solid var(--purple); background:rgba(139,92,246,.10); color:#EDE9FE;}
+        /* ── Confirm modal overlay ───────────────────────────────────── */
+        .confirm-overlay{
+            position:fixed; inset:0; background:rgba(0,0,0,.65); z-index:9998;
+            display:flex; align-items:center; justify-content:center;
+            backdrop-filter:blur(4px); animation:fadeIn .18s ease;
+        }
+        .confirm-box{
+            background:linear-gradient(160deg, #0F172A, #070E1C);
+            border:1px solid rgba(148,163,184,.25); border-radius:var(--radius-xl);
+            padding:28px 32px; max-width:480px; width:90%;
+            box-shadow:0 30px 80px rgba(0,0,0,.55); animation:slideUp .22s ease;
+        }
+        .confirm-title{font-size:20px; font-weight:900; color:#F8FAFC; margin-bottom:8px;}
+        .confirm-body{font-size:13.5px; color:#94A3B8; line-height:1.6; margin-bottom:20px;}
+        /* ── Toast ──────────────────────────────────────────────────── */
+        .toast{
+            position:fixed; top:18px; right:18px; z-index:9999;
+            max-width:400px; min-width:280px;
+            border-radius:var(--radius-md); padding:14px 18px;
+            box-shadow:0 12px 40px rgba(0,0,0,.45);
+            display:flex; align-items:flex-start; gap:12px;
+            animation:toastIn .3s cubic-bezier(.22,1,.36,1);
+            font-size:14px; font-weight:500; line-height:1.5;
+        }
+        .toast-icon{font-size:20px; flex-shrink:0; margin-top:1px;}
+        .toast-success{background:linear-gradient(135deg,#052e16,#052e16); border:1px solid #166534; color:#dcfce7;}
+        .toast-warning{background:linear-gradient(135deg,#1c1009,#1c1009); border:1px solid #92400e; color:#fef3c7;}
+        .toast-error  {background:linear-gradient(135deg,#1a0505,#1a0505); border:1px solid #7f1d1d; color:#fee2e2;}
+        .toast-info   {background:linear-gradient(135deg,#071928,#071928); border:1px solid #1e3a5f; color:#bae6fd;}
+        .toast-progress{
+            position:absolute; bottom:0; left:0; height:3px; border-radius:0 0 var(--radius-md) var(--radius-md);
+            animation:toastBar 4s linear forwards;
+        }
+        .toast-success .toast-progress{background:#22c55e;}
+        .toast-warning .toast-progress{background:#f97316;}
+        .toast-error   .toast-progress{background:#ef4444;}
+        .toast-info    .toast-progress{background:#38bdf8;}
+        /* ── Badges/pills ───────────────────────────────────────────── */
+        .pill{display:inline-block; padding:4px 10px; border-radius:999px;
+              background:rgba(56,189,248,.12); color:#BAE6FD;
+              border:1px solid rgba(56,189,248,.22); font-size:11.5px; margin-right:5px; font-weight:600;}
+        .badge{display:inline-block; padding:2px 8px; border-radius:6px; font-size:11px; font-weight:700;}
+        .badge-green{background:rgba(34,197,94,.18); color:#4ade80; border:1px solid rgba(34,197,94,.30);}
+        .badge-red  {background:rgba(239,68,68,.18);  color:#f87171; border:1px solid rgba(239,68,68,.30);}
+        .badge-orange{background:rgba(249,115,22,.18);color:#fb923c; border:1px solid rgba(249,115,22,.30);}
+        .badge-blue {background:rgba(56,189,248,.18); color:#38bdf8; border:1px solid rgba(56,189,248,.30);}
+        .badge-purple{background:rgba(139,92,246,.18);color:#a78bfa; border:1px solid rgba(139,92,246,.30);}
+        /* ── Login ──────────────────────────────────────────────────── */
+        .login-wrap{max-width:520px; margin:8vh auto 0 auto;}
+        .login-card{
+            border:1px solid rgba(148,163,184,.22); border-radius:var(--radius-xl);
+            padding:32px; background:linear-gradient(170deg, rgba(15,23,42,.95), rgba(3,7,18,.90));
+            box-shadow:var(--shadow-lg);
+        }
+        .login-title{font-size:28px; font-weight:950; color:#F8FAFC; margin:0 0 4px 0;}
+        .login-sub{font-size:13.5px; color:var(--muted); margin:0 0 20px 0;}
+        /* ── Field notes ────────────────────────────────────────────── */
+        .field-note{font-size:11.5px; color:var(--muted); margin-top:-6px; margin-bottom:8px;}
+        /* ── Buttons ────────────────────────────────────────────────── */
+        div[data-testid="stMetricValue"]{font-size:26px;}
+        .stButton>button{
+            border-radius:var(--radius-sm); font-weight:700; font-size:13.5px;
+            transition:transform .12s, box-shadow .12s;
+        }
+        .stButton>button:hover{transform:translateY(-1px); box-shadow:0 6px 20px rgba(0,0,0,.30);}
+        .stDownloadButton>button{border-radius:var(--radius-sm); font-weight:700;}
+        /* ── Animations ─────────────────────────────────────────────── */
+        @keyframes fadeIn{from{opacity:0}to{opacity:1}}
+        @keyframes slideUp{from{transform:translateY(24px);opacity:0}to{transform:translateY(0);opacity:1}}
+        @keyframes toastIn{from{transform:translateX(110%);opacity:0}to{transform:translateX(0);opacity:1}}
+        @keyframes toastOut{to{transform:translateX(110%);opacity:0}}
+        @keyframes toastBar{from{width:100%}to{width:0%}}
+        /* ── Kardex table colors ────────────────────────────────────── */
+        .kdx-row-ok  {background:rgba(34,197,94,.06);}
+        .kdx-row-warn{background:rgba(249,115,22,.06);}
+        .kdx-row-crit{background:rgba(239,68,68,.06);}
         </style>
         """,
         unsafe_allow_html=True,
@@ -1744,13 +1942,16 @@ def card_start(title: str, subtitle: str = "") -> None:
     )
 
 
-def kpi_card(label: str, value, note: str = "") -> None:
+def kpi_card(label: str, value, note: str = "", color: str = "#38BDF8", trend: str = "") -> None:
+    trend_html = f'<div class="kpi-trend" style="color:{color};">{trend}</div>' if trend else ""
     st.markdown(
         f"""
-        <div class="kpi-card">
+        <div class="kpi-card" style="border-color:{color}22; border-top:2px solid {color}55;">
+            <div class="kpi-accent" style="background:{color};"></div>
             <div class="kpi-label">{label}</div>
-            <div class="kpi-value">{value}</div>
+            <div class="kpi-value" style="color:{color};">{value}</div>
             <div class="kpi-note">{note}</div>
+            {trend_html}
         </div>
         """,
         unsafe_allow_html=True,
@@ -2704,7 +2905,10 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
     # ========================================================
     if tipo == "Ingreso":
         st.markdown("<div class='form-card'>", unsafe_allow_html=True)
-        st.markdown("#### 1) Producto / datos del catálogo")
+        st.markdown(
+            "<div class='step-title'><span class='step-badge'>1</span>Producto del catálogo</div>",
+            unsafe_allow_html=True
+        )
         productos_ord = productos.sort_values(["nombre_producto", "codigo_producto"], na_position="last")
         labels = productos_ord.apply(
             lambda r: f"{clean_str(r['nombre_producto'])} | Código: {clean_str(r['codigo_producto']) or 'Sin código'} | Marca: {clean_str(r['marca_default']) or 'Sin marca'}",
@@ -2722,13 +2926,19 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
         mov_nonce = int(st.session_state.get("mov_form_nonce", 0))
         st.markdown("<div class='form-card'>", unsafe_allow_html=True)
         with st.form(f"frm_ingreso_{mov_nonce}", clear_on_submit=True):
-            st.markdown("#### 2) Datos del ingreso")
+            st.markdown(
+                "<div class='step-title'><span class='step-badge'>2</span>Datos del ingreso</div><hr class='step-divider'>",
+                unsafe_allow_html=True
+            )
             c1, c2, c3 = st.columns(3)
             fecha = c1.date_input("Fecha del ingreso", value=TODAY.date())
             usuario = c2.text_input("Usuario que registra", value=st.session_state.get("nombre_usuario", "Usuario"))
             cantidad = c3.number_input("Cantidad", min_value=0.0, step=1.0, format="%.2f")
 
-            st.markdown("#### 3) Datos del lote / presentación")
+            st.markdown(
+                "<div class='step-title'><span class='step-badge'>3</span>Datos del lote</div><hr class='step-divider'>",
+                unsafe_allow_html=True
+            )
             unidades = sorted(set([u for u in UNIDADES_DEFAULT + [unidad_default] if clean_str(u)]))
             unidad_index = unidades.index(unidad_default) if unidad_default in unidades else 0
             a, b, c = st.columns(3)
@@ -2740,26 +2950,52 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             fecha_vencimiento_dt = e.date_input("Fecha de vencimiento", value=(TODAY + pd.Timedelta(days=365)).date())
             costo_total = f.number_input("Costo total", min_value=0.0, step=1.0, format="%.2f")
 
-            st.markdown("#### 4) Proveedor / compra / responsable")
+            st.markdown(
+                "<div class='step-title'><span class='step-badge'>4</span>Proveedor y logística</div><hr class='step-divider'>",
+                unsafe_allow_html=True
+            )
             g, h, i = st.columns(3)
             proveedor = g.selectbox("Proveedor *", [""] + proveedores["proveedor"].dropna().astype(str).sort_values().tolist())
             orden_compra = h.text_input("Orden de compra", placeholder="Ejemplo: OC-2026-001")
             personal = i.selectbox("Personal que recibe", [""] + personal_df["nombre"].dropna().astype(str).sort_values().tolist())
             observacion = st.text_area("Observación", placeholder="Detalle de factura, donación, compra u otra referencia.")
-            submitted = st.form_submit_button("💾 Guardar ingreso", use_container_width=True)
+            submitted = st.form_submit_button("💾 Guardar ingreso →", use_container_width=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
         if submitted:
             if not require_permission(data, "registrar_movimientos", "registrar movimientos"):
                 return
             if cantidad <= 0:
-                st.error("La cantidad debe ser mayor a cero.")
+                st.error("⚠️ La cantidad debe ser mayor a cero.")
                 return
             if not lote:
-                st.error("El lote es obligatorio.")
+                st.error("⚠️ El lote es obligatorio.")
                 return
             if not proveedor:
-                st.error("Para ingresos debe seleccionar proveedor.")
+                st.error("⚠️ Para ingresos debe seleccionar proveedor.")
+                return
+            set_confirm_pending(f"guardar_ingreso_{lote}_{producto_id}", {
+                "producto": producto, "lote": lote, "cantidad": cantidad,
+                "proveedor": proveedor, "unidad": unidad,
+            })
+
+        confirm_key_ing = f"guardar_ingreso_{lote}_{producto_id}" if submitted or confirm_pending(f"guardar_ingreso_{lote}_{producto_id}") else ""
+        if confirm_key_ing and confirm_pending(confirm_key_ing):
+            _pay = get_confirm_payload(confirm_key_ing)
+            confirmed_ing = render_confirm_box(
+                key=confirm_key_ing,
+                title="¿Confirmar ingreso al inventario?",
+                body=(
+                    f"<b>Producto:</b> {_pay.get('producto','')}<br>"
+                    f"<b>Lote:</b> {_pay.get('lote','')}<br>"
+                    f"<b>Cantidad:</b> {_pay.get('cantidad',0):g} {_pay.get('unidad','')}<br>"
+                    f"<b>Proveedor:</b> {_pay.get('proveedor','')}"
+                ),
+                confirm_label="✅ Confirmar ingreso",
+                cancel_label="↩ Cancelar",
+                danger=False,
+            )
+            if not confirmed_ing:
                 return
             row = {
                 "movimiento_id": next_code("MOV", movimientos, "movimiento_id", 6),
@@ -2946,7 +3182,7 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             )
             st.caption(f"En el acta se imprimirá: 'se hace entrega formal de los siguientes {tipo_entrega_texto}...'")
             generar_acta = st.checkbox("Generar acta de entrega en PDF", value=True)
-            submitted = st.form_submit_button("💾 Guardar salida y generar acta", use_container_width=True)
+            submitted = st.form_submit_button("📤 Solicitar salida →", use_container_width=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
         if submitted:
@@ -2954,14 +3190,41 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
                 return
             cart = st.session_state.get("salida_cart", [])
             if not cart:
-                st.error("Debe agregar al menos un producto al carrito.")
+                st.error("⚠️ Debe agregar al menos un producto al carrito.")
                 return
             if not solicitante:
-                st.error("Debe seleccionar el sitio/unidad solicitante.")
+                st.error("⚠️ Debe seleccionar el sitio/unidad solicitante.")
                 return
             if not personal:
-                st.error("Debe seleccionar el personal que entrega.")
+                st.error("⚠️ Debe seleccionar el personal que entrega.")
                 return
+            total_sal = sum(float(x.get("cantidad", 0)) for x in cart)
+            summary_sal = ", ".join(f"{x['producto']} x{float(x['cantidad']):g}" for x in cart[:3])
+            if len(cart) > 3: summary_sal += f" y {len(cart)-3} más"
+            set_confirm_pending(f"conf_sal_{solicitante}", {
+                "solicitante": solicitante, "personal": personal,
+                "n_items": len(cart), "total": total_sal, "resumen": summary_sal,
+            })
+
+        _ck_sal = f"conf_sal_{solicitante}" if (submitted or confirm_pending(f"conf_sal_{solicitante}")) else ""
+        if _ck_sal and confirm_pending(_ck_sal):
+            _p_sal = get_confirm_payload(_ck_sal)
+            _confirmed_sal = render_confirm_box(
+                key=_ck_sal,
+                title=f"¿Confirmar salida a {_p_sal.get('solicitante','')}?",
+                body=(
+                    f"<b>Destinatario:</b> {_p_sal.get('solicitante','')}<br>"
+                    f"<b>Entrega:</b> {_p_sal.get('personal','')}<br>"
+                    f"<b>Productos:</b> {_p_sal.get('resumen','')}<br>"
+                    f"<b>Total unidades:</b> {_p_sal.get('total',0):g}"
+                ),
+                confirm_label="✅ Confirmar salida",
+                cancel_label="↩ Cancelar",
+                danger=False,
+            )
+            if not _confirmed_sal:
+                return
+            cart = st.session_state.get("salida_cart", [])
             # Validación final contra stock actual en pantalla.
             for item in cart:
                 same = [x for x in cart if x.get("item_key") == item.get("item_key")]
@@ -3299,31 +3562,66 @@ def page_kardex_consolidado(kardex: pd.DataFrame, storage=None, data: Dict[str, 
         df = df[df["saldo_actual"] <= 0]
 
     total_ingresado = float(df["entrada_total"].sum()) if not df.empty else 0
-    total_salida = float(df["salida_total"].sum()) if not df.empty else 0
-    total_saldo = float(df["saldo_actual"].sum()) if not df.empty else 0
-    k1, k2, k3, k4 = st.columns(4)
-    with k1: kpi_card("Lotes en vista", f"{len(df):,}", "Filas consolidadas")
-    with k2: kpi_card("Entrada total", f"{total_ingresado:,.0f}", "Cantidad acumulada")
-    with k3: kpi_card("Salida total", f"{total_salida:,.0f}", "Cantidad entregada")
-    with k4: kpi_card("Saldo actual", f"{total_saldo:,.0f}", "Cantidad restante")
+    total_salida    = float(df["salida_total"].sum())  if not df.empty else 0
+    total_saldo     = float(df["saldo_actual"].sum())  if not df.empty else 0
+    lotes_criticos  = int((df["dias_para_vencer"].fillna(999).astype(float) <= 30).sum()) if not df.empty else 0
+    lotes_bajo_min  = int((
+        (to_number(df["saldo_actual"]) > 0) &
+        (to_number(df["saldo_actual"]) < to_number(df["stock_minimo"]))
+    ).sum()) if not df.empty else 0
+    pct_consumido   = round(total_salida / total_ingresado * 100, 1) if total_ingresado > 0 else 0.0
 
-    st.write("")
-    card_start("Tabla consolidada", "La salida se refleja en la misma fila del ingreso/lote. Use 'Detalle salidas' para ver entregas múltiples.")
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    with k1: kpi_card("Lotes", f"{len(df):,}", "en la vista actual", color="#38BDF8")
+    with k2: kpi_card("Ingresado", f"{total_ingresado:,.0f}", "unidades totales", color="#22C55E")
+    with k3: kpi_card("Entregado", f"{total_salida:,.0f}", "unidades salidas", color="#F97316")
+    with k4: kpi_card("Saldo", f"{total_saldo:,.0f}", "unidades disponibles", color="#8B5CF6",
+                       trend=f"Consumido: {pct_consumido}%")
+    with k5: kpi_card("⏰ Por vencer", f"{lotes_criticos}", "en ≤ 30 días", color="#EAB308")
+    with k6: kpi_card("📉 Bajo mínimo", f"{lotes_bajo_min}", "lotes con stock bajo", color="#EF4444")
+
+    st.markdown("")
+
+    # ── Color-coded table ──────────────────────────────────────────────────
+    card_start(
+        "Tabla consolidada por lote",
+        "Verde = disponible · Naranja = cerca de vencer o bajo mínimo · Rojo = vencido o sin stock",
+    )
+
+    if not df.empty:
+        def _row_class(row: pd.Series) -> str:
+            dias = float(pd.to_numeric(row.get("dias_para_vencer", 9999), errors="coerce") or 9999)
+            saldo = float(pd.to_numeric(row.get("saldo_actual", 0), errors="coerce") or 0)
+            min_s = float(pd.to_numeric(row.get("stock_minimo", 0), errors="coerce") or 0)
+            if dias <= 0 or saldo <= 0:
+                return "🔴"
+            if dias <= 30 or (min_s > 0 and saldo < min_s):
+                return "🟡"
+            return "🟢"
+        df = df.copy()
+        df.insert(0, "🚦", df.apply(_row_class, axis=1))
+
     cols_view = [
-        "estado", "producto", "marca", "lote", "unidad", "fecha_ingreso", "proveedor_ingreso",
-        "fecha_elaboracion", "fecha_vencimiento", "entrada_total", "salida_total", "saldo_actual",
-        "numero_salidas", "fecha_ultima_salida", "ultimo_entregado_a", "ultimo_personal_entrega",
-        "detalle_salidas", "dias_para_vencer", "stock_minimo",
+        "🚦", "estado", "producto", "marca", "lote", "unidad",
+        "fecha_ingreso", "proveedor_ingreso",
+        "fecha_vencimiento", "dias_para_vencer",
+        "entrada_total", "salida_total", "saldo_actual", "stock_minimo",
+        "numero_salidas", "fecha_ultima_salida", "ultimo_entregado_a",
+        "detalle_salidas",
     ]
+    available_cols = [c for c in cols_view if c in df.columns]
     st.dataframe(
-        df[cols_view],
+        df[available_cols],
         use_container_width=True,
         hide_index=True,
         column_config={
-            "entrada_total": st.column_config.NumberColumn("Entrada", format="%.0f"),
-            "salida_total": st.column_config.NumberColumn("Salida acumulada", format="%.0f"),
-            "saldo_actual": st.column_config.NumberColumn("Saldo actual", format="%.0f"),
-            "numero_salidas": st.column_config.NumberColumn("No. salidas", format="%d"),
+            "🚦":             st.column_config.TextColumn("", width=30),
+            "entrada_total":  st.column_config.NumberColumn("📥 Entrada",  format="%.0f"),
+            "salida_total":   st.column_config.NumberColumn("📤 Salida",   format="%.0f"),
+            "saldo_actual":   st.column_config.NumberColumn("📦 Saldo",    format="%.0f"),
+            "stock_minimo":   st.column_config.NumberColumn("Mín.",        format="%.0f"),
+            "dias_para_vencer": st.column_config.NumberColumn("Días vence", format="%d"),
+            "numero_salidas": st.column_config.NumberColumn("# Salidas",   format="%d"),
             "detalle_salidas": st.column_config.TextColumn("Detalle salidas", width="large"),
         },
     )
@@ -4059,10 +4357,44 @@ def render_movement_crud_controls(storage, data: Dict[str, pd.DataFrame]) -> Non
                 )
                 submitted_edit = st.form_submit_button("💾 Guardar cambios", use_container_width=True)
 
+            confirm_key_edit = f"edit_{mov_id}"
+
             if submitted_edit:
                 if not motivo:
-                    st.error("El motivo es obligatorio. Explique por qué realiza esta modificación.")
+                    st.error("El motivo de modificación es obligatorio.")
                     return
+                set_confirm_pending(confirm_key_edit, {
+                    "new_values": new_values, "motivo": motivo,
+                    "tipo_mov": tipo_mov, "mov_id": mov_id,
+                })
+                st.rerun()
+
+            if confirm_pending(confirm_key_edit):
+                payload_e = get_confirm_payload(confirm_key_edit)
+                nv_e = payload_e.get("new_values", {})
+                motivo_e = payload_e.get("motivo", "")
+                new_cant  = nv_e.get("cantidad", val_cant)
+                diff_cant = float(pd.to_numeric(new_cant, errors="coerce") or 0) - val_cant
+                diff_txt  = (f" → <b style='color:#22C55E;'>+{diff_cant:g}</b>" if diff_cant > 0
+                             else f" → <b style='color:#EF4444;'>{diff_cant:g}</b>") if diff_cant != 0 else ""
+                confirmed_edit = render_confirm_box(
+                    key=confirm_key_edit,
+                    title=f"¿Confirmar modificación de {mov_id}?",
+                    body=(
+                        f"<b>Tipo:</b> {tipo_mov} &nbsp;|&nbsp; "
+                        f"<b>Producto:</b> {clean_str(selected.get('producto',''))}<br>"
+                        f"<b>Cantidad:</b> {val_cant:g} {val_unidad}{diff_txt}<br>"
+                        f"<b>Motivo:</b> {motivo_e}<br><br>"
+                        "El Kardex y el stock se recalcularán automáticamente."
+                    ),
+                    confirm_label="💾 Sí, guardar cambios",
+                    cancel_label="↩ Cancelar",
+                    danger=False,
+                )
+                if not confirmed_edit:
+                    return
+                new_values = nv_e
+                motivo = motivo_e
                 # Guardar cambios con auditoría
                 new_df = movimientos.copy()
                 mask = new_df["movimiento_id"].astype(str) == mov_id
@@ -4141,47 +4473,70 @@ def render_movement_crud_controls(storage, data: Dict[str, pd.DataFrame]) -> Non
                 unsafe_allow_html=True,
             )
 
-            with st.form(f"frm_anular_{mov_id}"):
-                st.markdown(
-                    f"**Movimiento:** `{mov_id}` &nbsp;|&nbsp; **Tipo:** {tipo_mov} "
-                    f"&nbsp;|&nbsp; **Producto:** {clean_str(selected.get('producto',''))} "
-                    f"&nbsp;|&nbsp; **Cantidad:** {cant_actual:g} {val_unidad}"
-                )
-                motivo_anulacion = st.text_area(
-                    "Motivo de la anulación *",
-                    placeholder="Explique el motivo. Ej: cantidad incorrecta, movimiento duplicado, error de lote.",
-                )
-                confirmar = st.checkbox(
-                    f"✅ Confirmo que deseo anular el movimiento {mov_id}. "
-                    "Entiendo que este movimiento no se eliminará, pero dejará de afectar el stock."
-                )
-                submitted_anular = st.form_submit_button("🚫 Confirmar anulación", use_container_width=True)
+            confirm_key_anular = f"anular_{mov_id}"
 
-            if submitted_anular:
-                if not motivo_anulacion:
-                    st.error("El motivo de anulación es obligatorio.")
-                    return
-                if not confirmar:
-                    st.error("Debe marcar la casilla de confirmación para continuar.")
-                    return
-                new_df = movimientos.copy()
-                mask = new_df["movimiento_id"].astype(str) == mov_id
-                new_df.loc[mask, "estado_movimiento"] = "Anulado"
-                new_df.loc[mask, "anulado_por"]       = current_username()
-                new_df.loc[mask, "fecha_anulacion"]   = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-                new_df.loc[mask, "motivo_anulacion"]  = motivo_anulacion
-                storage.save("Movimientos", ensure_columns(new_df, "Movimientos"))
-                append_audit(storage, "ANULAR_MOVIMIENTO", "Movimientos", mov_id,
-                             "estado_movimiento", "Vigente", "Anulado",
-                             motivo_anulacion, f"Anulación lógica de {tipo_mov} {mov_id}")
-                sync_data = dict(data)
-                sync_data["Movimientos"] = ensure_columns(new_df, "Movimientos")
-                try:
-                    sync_kardex_consolidado_sheet(storage, sync_data)
-                except Exception:
-                    pass
-                set_flash(f"✅ Movimiento {mov_id} anulado. El stock fue recalculado.")
-                rerun()
+            # Step 1: Motivo form
+            if not confirm_pending(confirm_key_anular):
+                with st.form(f"frm_anular_{mov_id}"):
+                    st.markdown(
+                        f"**Movimiento:** `{mov_id}` &nbsp;|&nbsp; **Tipo:** {tipo_mov} "
+                        f"&nbsp;|&nbsp; **Producto:** {clean_str(selected.get('producto',''))} "
+                        f"&nbsp;|&nbsp; **Cantidad:** {cant_actual:g} {val_unidad}"
+                    )
+                    motivo_anulacion_input = st.text_area(
+                        "Motivo de la anulación *",
+                        placeholder="Explique el motivo. Ej: cantidad incorrecta, movimiento duplicado, error de lote.",
+                        key=f"motivo_anular_{mov_id}",
+                    )
+                    step1 = st.form_submit_button("🚫 Solicitar anulación →", use_container_width=True)
+                if step1:
+                    if not motivo_anulacion_input:
+                        st.error("El motivo de anulación es obligatorio antes de continuar.")
+                    else:
+                        set_confirm_pending(confirm_key_anular, {
+                            "motivo": motivo_anulacion_input,
+                            "mov_id": mov_id,
+                        })
+                        st.rerun()
+
+            # Step 2: Confirmation card
+            else:
+                payload = get_confirm_payload(confirm_key_anular)
+                motivo_anulacion = payload.get("motivo", "")
+                confirmed = render_confirm_box(
+                    key=confirm_key_anular,
+                    title=f"¿Confirmar anulación de {mov_id}?",
+                    body=(
+                        f"Esta acción marcará el movimiento como <b>Anulado</b>. "
+                        f"No se elimina, pero <b>dejará de afectar el stock</b>.<br><br>"
+                        f"<b>Movimiento:</b> {mov_id} — {tipo_mov}<br>"
+                        f"<b>Producto:</b> {clean_str(selected.get('producto',''))}<br>"
+                        f"<b>Cantidad:</b> {cant_actual:g} {val_unidad}<br>"
+                        f"<b>Motivo:</b> {motivo_anulacion}"
+                    ),
+                    confirm_label="🚫 Sí, anular definitivamente",
+                    cancel_label="↩ Cancelar",
+                    danger=True,
+                )
+                if confirmed:
+                    new_df = movimientos.copy()
+                    mask = new_df["movimiento_id"].astype(str) == mov_id
+                    new_df.loc[mask, "estado_movimiento"] = "Anulado"
+                    new_df.loc[mask, "anulado_por"]       = current_username()
+                    new_df.loc[mask, "fecha_anulacion"]   = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+                    new_df.loc[mask, "motivo_anulacion"]  = motivo_anulacion
+                    storage.save("Movimientos", ensure_columns(new_df, "Movimientos"))
+                    append_audit(storage, "ANULAR_MOVIMIENTO", "Movimientos", mov_id,
+                                 "estado_movimiento", "Vigente", "Anulado",
+                                 motivo_anulacion, f"Anulación lógica de {tipo_mov} {mov_id}")
+                    sync_data = dict(data)
+                    sync_data["Movimientos"] = ensure_columns(new_df, "Movimientos")
+                    try:
+                        sync_kardex_consolidado_sheet(storage, sync_data)
+                    except Exception:
+                        pass
+                    set_flash(f"Movimiento {mov_id} anulado. El stock fue recalculado.", "success")
+                    rerun()
 
 
 
