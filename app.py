@@ -3094,20 +3094,42 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             axis=1,
         )
 
+        # ── Selector de producto FUERA del form → rerun inmediato al cambiar ──
+        productos_lista = ["Todos"] + sorted(disponibles["producto"].dropna().astype(str).unique().tolist())
+        filtro_producto = st.selectbox(
+            "Producto",
+            productos_lista,
+            key="sel_producto_carrito",
+        )
+
+        lotes_view = disponibles.copy()
+        if filtro_producto != "Todos":
+            lotes_view = lotes_view[lotes_view["producto"].astype(str) == filtro_producto]
+
+        # Mostrar info del lote seleccionado antes del form
+        lotes_opciones = lotes_view["label"].tolist()
+
+        # ── Form de cantidad: solo lote y cantidad, el producto ya está fijo ──
         with st.form("frm_add_cart_salida", clear_on_submit=True):
-            cprod, clote, ccant = st.columns([1, 1.9, .8])
-            filtro_producto = cprod.selectbox("Producto", ["Todos"] + sorted(disponibles["producto"].dropna().astype(str).unique().tolist()))
-            lotes_view = disponibles.copy()
-            if filtro_producto != "Todos":
-                lotes_view = lotes_view[lotes_view["producto"].astype(str) == filtro_producto]
-            label = clote.selectbox("Lote disponible", lotes_view["label"].tolist())
-            selected_stock_row = lotes_view[lotes_view["label"] == label].iloc[0]
+            clote, ccant = st.columns([2.5, .8])
+            label = clote.selectbox(
+                "Lote disponible",
+                lotes_opciones if lotes_opciones else ["— Sin lotes disponibles —"],
+                help="Lotes filtrados según el producto seleccionado arriba.",
+            )
             cantidad_item = ccant.number_input("Cantidad", min_value=0.0, step=1.0, format="%.2f")
             add_item = st.form_submit_button("➕ Agregar al carrito", use_container_width=True)
 
+        # Buscar la fila seleccionada DESPUÉS del form
+        selected_stock_row = None
+        if lotes_opciones and label in lotes_view["label"].values:
+            selected_stock_row = lotes_view[lotes_view["label"] == label].iloc[0]
+
         if add_item:
-            if cantidad_item <= 0:
-                st.error("Ingrese una cantidad mayor a cero.")
+            if not lotes_opciones or selected_stock_row is None:
+                st.error("⚠️ No hay lotes disponibles para el producto seleccionado.")
+            elif cantidad_item <= 0:
+                st.error("⚠️ Ingrese una cantidad mayor a cero.")
             else:
                 item_key = "|".join([
                     clean_str(selected_stock_row.get("producto_id", "")), clean_str(selected_stock_row.get("lote", "")),
