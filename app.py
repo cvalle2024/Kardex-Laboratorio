@@ -3733,27 +3733,97 @@ def render_movement_crud_controls(storage, data: Dict[str, pd.DataFrame]) -> Non
         show = show[show.astype(str).apply(lambda col: col.str.contains(filtro_producto, case=False, na=False)).any(axis=1)]
     st.dataframe(show[["movimiento_id", "fecha", "tipo_movimiento", "producto", "marca", "lote", "solicitante", "proveedor", "cantidad", "unidad", "estado_movimiento", "usuario_registro", "fecha_registro", "motivo_anulacion"]], use_container_width=True, hide_index=True)
 
-    labels = movimientos.apply(lambda r: f"{clean_str(r['movimiento_id'])} | {clean_str(r['fecha'])} | {clean_str(r['tipo_movimiento'])} | {clean_str(r['producto'])} | Lote {clean_str(r['lote'])} | Cant. {clean_str(r['cantidad'])} | Estado {clean_str(r.get('estado_movimiento', 'Vigente'))}", axis=1).tolist()
-    selected_label = st.selectbox("Seleccionar movimiento", labels, key="sel_mov_crud")
+    # ── Selector mejorado: filtrar primero, luego seleccionar ───────────────
+    st.markdown("#### Seleccionar movimiento a gestionar")
+    col_f1, col_f2 = st.columns([2, 1])
+    filtro_sel_prod = col_f1.text_input("🔍 Filtrar por producto/lote/ID", key="filtro_sel_prod_crud",
+                                        placeholder="Escriba parte del nombre, lote o ID...")
+    filtro_sel_tipo = col_f2.selectbox("Tipo de movimiento", ["Todos"] + TIPOS_MOVIMIENTO, key="filtro_sel_tipo_crud")
+
+    mov_para_sel = show.copy() if not show.empty else movimientos.copy()
+    if filtro_sel_prod:
+        mov_para_sel = mov_para_sel[
+            mov_para_sel.astype(str).apply(
+                lambda col: col.str.contains(filtro_sel_prod, case=False, na=False)
+            ).any(axis=1)
+        ]
+    if filtro_sel_tipo != "Todos":
+        mov_para_sel = mov_para_sel[mov_para_sel["tipo_movimiento"].astype(str) == filtro_sel_tipo]
+
+    if mov_para_sel.empty:
+        st.warning("No hay movimientos con esos filtros. Ajuste los filtros de búsqueda arriba.")
+        return
+
+    labels = mov_para_sel.apply(
+        lambda r: (
+            f"[{clean_str(r.get('estado_movimiento','Vigente')).upper()}] "
+            f"{clean_str(r['movimiento_id'])} | {clean_str(r['fecha'])} | "
+            f"{clean_str(r['tipo_movimiento'])} | {clean_str(r['producto'])} | "
+            f"Lote: {clean_str(r['lote'])} | Cant: {clean_str(r['cantidad'])} {clean_str(r.get('unidad',''))}"
+        ),
+        axis=1,
+    ).tolist()
+    selected_label = st.selectbox("Movimiento seleccionado", labels, key="sel_mov_crud")
     selected_idx = labels.index(selected_label)
-    selected = movimientos.iloc[selected_idx].copy()
+    selected = mov_para_sel.iloc[selected_idx].copy()
     mov_id = clean_str(selected.get("movimiento_id", ""))
 
-    tab_anular, tab_editar = st.tabs(["Anular movimiento", "Editar datos administrativos"])
+    # ── Tarjeta de resumen del movimiento seleccionado ──────────────────────
+    est_mov = clean_str(selected.get("estado_movimiento", "Vigente"))
+    color_estado = "#22C55E" if est_mov.lower() == "vigente" else "#EF4444"
+    tipo_mov = clean_str(selected.get("tipo_movimiento", ""))
+    cant_actual = to_number(selected.get("cantidad", 0))
+    st.markdown(
+        f"""
+        <div style="border:1px solid rgba(148,163,184,.25); border-radius:18px; padding:16px 20px; margin:12px 0;
+                    background:linear-gradient(135deg,rgba(15,23,42,.90),rgba(2,6,23,.80));">
+            <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+                <span style="font-size:20px; font-weight:900; color:#F8FAFC;">{mov_id}</span>
+                <span style="padding:3px 10px; border-radius:999px; background:{color_estado}22;
+                             color:{color_estado}; border:1px solid {color_estado}44; font-size:12px; font-weight:700;">
+                    {est_mov}
+                </span>
+                <span style="padding:3px 10px; border-radius:999px; background:rgba(56,189,248,.15);
+                             color:#38BDF8; border:1px solid rgba(56,189,248,.30); font-size:12px;">
+                    {tipo_mov}
+                </span>
+            </div>
+            <div style="display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin-top:12px;">
+                <div style="font-size:12px; color:#94A3B8;"><b style="color:#E5E7EB;">Producto</b><br>{clean_str(selected.get('producto',''))}</div>
+                <div style="font-size:12px; color:#94A3B8;"><b style="color:#E5E7EB;">Lote</b><br>{clean_str(selected.get('lote',''))}</div>
+                <div style="font-size:12px; color:#94A3B8;"><b style="color:#E5E7EB;">Cantidad actual</b><br><span style="font-size:18px; font-weight:900; color:#38BDF8;">{cant_actual:g}</span> {clean_str(selected.get('unidad',''))}</div>
+                <div style="font-size:12px; color:#94A3B8;"><b style="color:#E5E7EB;">Fecha</b><br>{clean_str(selected.get('fecha',''))}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    tab_anular, tab_editar = st.tabs(["🚫 Anular movimiento", "✏️ Editar movimiento"])
     with tab_anular:
         if not user_has_permission(data, "anular_movimientos"):
             st.info("No tiene permiso para anular movimientos. Solicítelo al administrador.")
-        elif clean_str(selected.get("estado_movimiento", "Vigente")).lower() == "anulado":
-            st.warning("Este movimiento ya está anulado.")
+        elif est_mov.lower() == "anulado":
+            st.markdown(
+                "<div class='alert-red'>⚠️ Este movimiento ya está <b>anulado</b>. No puede anularse de nuevo. "
+                "Si fue un error, contacte al administrador para revisión en auditoría.</div>",
+                unsafe_allow_html=True,
+            )
         else:
+            st.markdown(
+                "<div class='alert-orange' style='margin-bottom:12px;'>⚠️ La anulación es <b>permanente</b>. "
+                "El movimiento quedará en auditoría pero <b>no</b> afectará el stock. "
+                "El stock y Kardex se recalcularán automáticamente.</div>",
+                unsafe_allow_html=True,
+            )
             with st.form(f"frm_anular_{mov_id}"):
-                st.markdown(f"**Movimiento:** {mov_id}")
+                st.markdown(f"**Movimiento a anular:** `{mov_id}` — {tipo_mov} de **{clean_str(selected.get('producto',''))}** | Cantidad: **{cant_actual:g}** {clean_str(selected.get('unidad',''))}")
                 motivo = st.text_area("Motivo de anulación *", placeholder="Ejemplo: error de digitación, salida duplicada, ingreso registrado en lote incorrecto.")
-                confirmar = st.checkbox("Confirmo que deseo anular este movimiento. No se eliminará; quedará en auditoría.")
+                confirmar = st.checkbox("✅ Confirmo que deseo anular este movimiento. No se eliminará; quedará en auditoría.")
                 submitted = st.form_submit_button("🚫 Anular movimiento", use_container_width=True)
             if submitted:
                 if not motivo or not confirmar:
-                    st.error("Debe ingresar motivo y confirmar la anulación.")
+                    st.error("Debe ingresar motivo y marcar la confirmación para continuar.")
                     return
                 new_df = movimientos.copy()
                 mask = new_df["movimiento_id"].astype(str) == mov_id
@@ -3775,38 +3845,143 @@ def render_movement_crud_controls(storage, data: Dict[str, pd.DataFrame]) -> Non
     with tab_editar:
         if not user_has_permission(data, "editar_movimientos"):
             st.info("No tiene permiso para editar movimientos. Solicítelo al administrador.")
+        elif est_mov.lower() == "anulado":
+            st.markdown(
+                "<div class='alert-red'>⚠️ Este movimiento está <b>anulado</b> y no puede editarse. "
+                "Solo los movimientos vigentes son editables.</div>",
+                unsafe_allow_html=True,
+            )
         else:
-            st.caption("Solo edite datos administrativos. Para cambios de cantidad o tipo de movimiento, use Corrección o Anulación para conservar trazabilidad.")
+            st.markdown(
+                "<div class='alert-orange' style='margin-bottom:12px;'>📋 Todos los cambios quedan registrados en la <b>auditoría</b> del sistema "
+                "con usuario, fecha y motivo. El <b>motivo es obligatorio</b>.</div>",
+                unsafe_allow_html=True,
+            )
+
+            # ── Valores actuales del movimiento ──────────────────────────────
+            val_cantidad_actual = to_number(selected.get("cantidad", 0))
+            val_lote_actual     = clean_str(selected.get("lote", ""))
+            val_marca_actual    = clean_str(selected.get("marca", ""))
+            val_unidad_actual   = clean_str(selected.get("unidad", ""))
+            val_fecha_actual    = clean_str(selected.get("fecha", ""))
+            val_proveedor_actual  = clean_str(selected.get("proveedor", ""))
+            val_solicitante_actual = clean_str(selected.get("solicitante", ""))
+            val_personal_actual   = clean_str(selected.get("personal", ""))
+            val_oc_actual         = clean_str(selected.get("orden_compra", ""))
+            val_obs_actual        = clean_str(selected.get("observacion", ""))
+
             with st.form(f"frm_editar_mov_{mov_id}"):
+                st.markdown("#### 📦 Datos del movimiento (cantidad y lote)")
+                col_a, col_b, col_c = st.columns(3)
+                nueva_cantidad = col_a.number_input(
+                    "Cantidad *",
+                    min_value=0.0,
+                    value=float(val_cantidad_actual),
+                    step=1.0,
+                    format="%.2f",
+                    help="Modifique la cantidad si hubo un error al registrarla.",
+                )
+                nuevo_lote = col_b.text_input("Lote", value=val_lote_actual)
+                nueva_marca = col_c.text_input("Marca", value=val_marca_actual)
+
+                unidades_edit = sorted(set([u for u in UNIDADES_DEFAULT + [val_unidad_actual] if clean_str(u)]))
+                unidad_idx = unidades_edit.index(val_unidad_actual) if val_unidad_actual in unidades_edit else 0
+                nueva_unidad = st.selectbox("Unidad", unidades_edit, index=unidad_idx)
+
+                st.markdown("#### 📋 Datos administrativos")
                 c1, c2 = st.columns(2)
-                nueva_fecha = c1.text_input("Fecha", value=clean_str(selected.get("fecha", "")))
-                nuevo_personal = c2.text_input("Personal", value=clean_str(selected.get("personal", "")))
-                nuevo_proveedor = c1.text_input("Proveedor", value=clean_str(selected.get("proveedor", "")))
-                nuevo_solicitante = c2.text_input("Solicitante / destino", value=clean_str(selected.get("solicitante", "")))
-                nueva_oc = c1.text_input("Orden de compra", value=clean_str(selected.get("orden_compra", "")))
-                nueva_obs = st.text_area("Observación", value=clean_str(selected.get("observacion", "")))
-                motivo = st.text_area("Motivo de modificación *")
-                submitted = st.form_submit_button("💾 Guardar edición administrativa", use_container_width=True)
+                nueva_fecha      = c1.text_input("Fecha del movimiento", value=val_fecha_actual)
+                nuevo_personal   = c2.text_input("Personal", value=val_personal_actual)
+                nuevo_proveedor  = c1.text_input("Proveedor", value=val_proveedor_actual)
+                nuevo_solicitante = c2.text_input("Solicitante / destino", value=val_solicitante_actual)
+                nueva_oc         = c1.text_input("Orden de compra", value=val_oc_actual)
+                nueva_obs        = st.text_area("Observación", value=val_obs_actual)
+
+                st.markdown("---")
+                motivo = st.text_area(
+                    "Motivo de modificación *",
+                    placeholder="Explique por qué se modifica este movimiento. Ej: error de digitación, cantidad incorrecta al ingresar.",
+                )
+                submitted = st.form_submit_button("💾 Guardar cambios con auditoría", use_container_width=True)
+
+            # ── Vista previa del cambio de cantidad (fuera del form) ────────
+            if nueva_cantidad != val_cantidad_actual:
+                diff = nueva_cantidad - val_cantidad_actual
+                color_diff = "#22C55E" if diff > 0 else "#EF4444"
+                signo = "+" if diff > 0 else ""
+                st.markdown(
+                    f"""
+                    <div style="border:1px solid {color_diff}44; border-radius:14px; padding:12px 16px; margin:8px 0;
+                                background:{color_diff}11;">
+                        <b style="color:{color_diff};">⚡ Impacto en stock al guardar</b><br>
+                        <span style="color:#94A3B8; font-size:13px;">
+                            Cantidad anterior: <b style="color:#F8FAFC;">{val_cantidad_actual:g}</b> →
+                            Nueva cantidad: <b style="color:{color_diff};">{nueva_cantidad:g}</b>
+                            (<span style="color:{color_diff};">{signo}{diff:g}</span> {nueva_unidad})
+                        </span><br>
+                        <span style="color:#94A3B8; font-size:12px; margin-top:4px; display:block;">
+                            El Kardex y el stock se recalcularán automáticamente al guardar.
+                        </span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
             if submitted:
                 if not motivo:
-                    st.error("Debe ingresar el motivo de modificación.")
+                    st.error("El motivo de modificación es obligatorio.")
                     return
-                new_values = {"fecha": nueva_fecha, "personal": nuevo_personal, "proveedor": nuevo_proveedor, "solicitante": nuevo_solicitante, "orden_compra": nueva_oc, "observacion": nueva_obs}
+                new_values = {
+                    "cantidad":    nueva_cantidad,
+                    "lote":        nuevo_lote,
+                    "marca":       nueva_marca,
+                    "unidad":      nueva_unidad,
+                    "fecha":       nueva_fecha,
+                    "personal":    nuevo_personal,
+                    "proveedor":   nuevo_proveedor,
+                    "solicitante": nuevo_solicitante,
+                    "orden_compra": nueva_oc,
+                    "observacion": nueva_obs,
+                }
                 new_df = movimientos.copy()
                 mask = new_df["movimiento_id"].astype(str) == mov_id
                 audit_rows = []
+                cantidad_cambio = False
                 for col, val in new_values.items():
-                    old = clean_str(new_df.loc[mask, col].iloc[0])
-                    new = clean_str(val)
-                    if old != new:
+                    old_raw = new_df.loc[mask, col].iloc[0]
+                    old = str(to_number(old_raw)) if col == "cantidad" else clean_str(old_raw)
+                    new_val = str(to_number(val)) if col == "cantidad" else clean_str(val)
+                    if old != new_val:
                         new_df.loc[mask, col] = val
-                        audit_rows.append({"auditoria_id": f"AUD-{uuid.uuid4().hex[:12].upper()}", "fecha_evento": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"), "usuario": current_username(), "rol": current_role(), "accion": "EDITAR_MOVIMIENTO", "modulo": "Movimientos", "registro_id": mov_id, "campo": col, "valor_anterior": old, "valor_nuevo": new, "motivo": motivo, "detalle": "Edición administrativa de movimiento"})
-                new_df.loc[mask, "modificado_por"] = current_username()
-                new_df.loc[mask, "fecha_modificacion"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+                        if col == "cantidad":
+                            cantidad_cambio = True
+                        audit_rows.append({
+                            "auditoria_id": f"AUD-{uuid.uuid4().hex[:12].upper()}",
+                            "fecha_evento": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "usuario":      current_username(),
+                            "rol":          current_role(),
+                            "accion":       "EDITAR_MOVIMIENTO",
+                            "modulo":       "Movimientos",
+                            "registro_id":  mov_id,
+                            "campo":        col,
+                            "valor_anterior": old,
+                            "valor_nuevo":  new_val,
+                            "motivo":       motivo,
+                            "detalle":      f"Edición de movimiento {mov_id} — campo '{col}'",
+                        })
+                new_df.loc[mask, "modificado_por"]      = current_username()
+                new_df.loc[mask, "fecha_modificacion"]  = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
                 new_df.loc[mask, "motivo_modificacion"] = motivo
                 storage.save("Movimientos", ensure_columns(new_df, "Movimientos"))
                 append_audit_rows(storage, audit_rows)
-                set_flash("Movimiento actualizado correctamente con auditoría.")
+                if cantidad_cambio or any(k in new_values for k in ("lote", "marca", "unidad")):
+                    sync_data = dict(data)
+                    sync_data["Movimientos"] = ensure_columns(new_df, "Movimientos")
+                    try:
+                        sync_kardex_consolidado_sheet(storage, sync_data)
+                    except Exception:
+                        pass
+                set_flash("✅ Movimiento actualizado correctamente. Los cambios quedaron en auditoría.")
                 rerun()
 
 
