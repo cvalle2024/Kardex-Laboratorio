@@ -3772,7 +3772,7 @@ def render_movement_crud_controls(storage, data: Dict[str, pd.DataFrame]) -> Non
     est_mov = clean_str(selected.get("estado_movimiento", "Vigente"))
     color_estado = "#22C55E" if est_mov.lower() == "vigente" else "#EF4444"
     tipo_mov = clean_str(selected.get("tipo_movimiento", ""))
-    cant_actual = to_number(selected.get("cantidad", 0))
+    cant_actual = float(pd.to_numeric(selected.get("cantidad", 0), errors="coerce") or 0)
     st.markdown(
         f"""
         <div style="border:1px solid rgba(148,163,184,.25); border-radius:18px; padding:16px 20px; margin:12px 0;
@@ -3859,7 +3859,7 @@ def render_movement_crud_controls(storage, data: Dict[str, pd.DataFrame]) -> Non
             )
 
             # ── Valores actuales del movimiento ──────────────────────────────
-            val_cantidad_actual = to_number(selected.get("cantidad", 0))
+            val_cantidad_actual = float(pd.to_numeric(selected.get("cantidad", 0), errors="coerce") or 0)
             val_lote_actual     = clean_str(selected.get("lote", ""))
             val_marca_actual    = clean_str(selected.get("marca", ""))
             val_unidad_actual   = clean_str(selected.get("unidad", ""))
@@ -3949,8 +3949,8 @@ def render_movement_crud_controls(storage, data: Dict[str, pd.DataFrame]) -> Non
                 cantidad_cambio = False
                 for col, val in new_values.items():
                     old_raw = new_df.loc[mask, col].iloc[0]
-                    old = str(to_number(old_raw)) if col == "cantidad" else clean_str(old_raw)
-                    new_val = str(to_number(val)) if col == "cantidad" else clean_str(val)
+                    old = str(float(pd.to_numeric(old_raw, errors="coerce") or 0)) if col == "cantidad" else clean_str(old_raw)
+                    new_val = str(float(pd.to_numeric(val, errors="coerce") or 0)) if col == "cantidad" else clean_str(val)
                     if old != new_val:
                         new_df.loc[mask, col] = val
                         if col == "cantidad":
