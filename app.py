@@ -2541,8 +2541,8 @@ def build_acta_entrega_pdf(
 
 def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame) -> None:
     section_header(
-        "➕ Registrar movimientos",
-        "Ingreso, salida por carrito, devolución desde salidas históricas y correcciones de inventario con formularios guiados."
+        "📋 Movimientos de inventario",
+        "Registre ingresos, salidas y devoluciones. Si cometió un error en un movimiento ya guardado, use la opción Editar movimiento."
     )
 
     if not require_permission(data, "registrar_movimientos", "registrar movimientos"):
@@ -2637,17 +2637,65 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
         mark_data_dirty()
         rerun()
 
-    opciones_movimiento = list(TIPOS_MOVIMIENTO)
-    if user_has_permission(data, "anular_movimientos") or user_has_permission(data, "editar_movimientos"):
-        opciones_movimiento.append("Gestión de movimientos")
-    tipo = st.radio(
-        "Tipo de operación",
-        opciones_movimiento,
-        horizontal=True,
-        help="Salida permite seleccionar varios insumos en un carrito. Devolución se basa en las salidas registradas. Ajuste ahora se llama Corrección."
+    # ── Guía rápida de opciones ───────────────────────────────────────────
+    can_manage = (user_has_permission(data, "anular_movimientos")
+                  or user_has_permission(data, "editar_movimientos"))
+
+    st.markdown(
+        """
+        <div style="display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin:0 0 18px 0;">
+            <div style="border:1px solid rgba(56,189,248,.25); border-radius:14px; padding:12px 14px; background:rgba(56,189,248,.06);">
+                <div style="font-size:15px; font-weight:800; color:#38BDF8; margin-bottom:4px;">📥 Ingreso</div>
+                <div style="font-size:12px; color:#94A3B8;">Productos que llegan al inventario desde un proveedor.</div>
+            </div>
+            <div style="border:1px solid rgba(249,115,22,.25); border-radius:14px; padding:12px 14px; background:rgba(249,115,22,.06);">
+                <div style="font-size:15px; font-weight:800; color:#F97316; margin-bottom:4px;">📤 Salida</div>
+                <div style="font-size:12px; color:#94A3B8;">Productos que salen del inventario hacia un sitio o unidad.</div>
+            </div>
+            <div style="border:1px solid rgba(34,197,94,.25); border-radius:14px; padding:12px 14px; background:rgba(34,197,94,.06);">
+                <div style="font-size:15px; font-weight:800; color:#22C55E; margin-bottom:4px;">↩️ Devolución</div>
+                <div style="font-size:12px; color:#94A3B8;">Un sitio retorna productos que le habían sido entregados.</div>
+            </div>
+            <div style="border:1px solid rgba(139,92,246,.25); border-radius:14px; padding:12px 14px; background:rgba(139,92,246,.06);">
+                <div style="font-size:15px; font-weight:800; color:#8B5CF6; margin-bottom:4px;">🔧 Ajuste de inventario</div>
+                <div style="font-size:12px; color:#94A3B8;">Agrega o descuenta unidades por diferencia de conteo físico. <b style="color:#E5E7EB;">Crea un nuevo registro</b>, no modifica el anterior.</div>
+            </div>
+            <div style="border:1px solid rgba(239,68,68,.25); border-radius:14px; padding:12px 14px; background:rgba(239,68,68,.06); grid-column:span 2;">
+                <div style="font-size:15px; font-weight:800; color:#EF4444; margin-bottom:4px;">✏️ Editar movimiento existente</div>
+                <div style="font-size:12px; color:#94A3B8;">
+                    ¿Se equivocó en la cantidad, el lote o el sitio de un movimiento ya guardado?
+                    <b style="color:#F8FAFC;">Esta opción modifica directamente ese registro</b>
+                    y el stock se recalcula automáticamente.
+                    <br><span style="color:#EF4444;">→ Si registró 110 pero eran 80, aquí puede corregirlo y quedará como 80.</span>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    if tipo == "Gestión de movimientos":
+    _OPCIONES_LABEL = {
+        "Ingreso":            "📥 Ingreso — Nueva entrada al inventario",
+        "Salida":             "📤 Salida — Entrega a un sitio o unidad",
+        "Devolución":         "↩️ Devolución — Retorno de productos entregados",
+        "Corrección entrada": "🔧 Ajuste (+) — Agregar unidades por conteo físico",
+        "Corrección salida":  "🔧 Ajuste (–) — Descontar unidades por conteo físico",
+        "Editar movimiento":  "✏️ Editar movimiento — Corregir un registro ya guardado",
+    }
+
+    opciones_movimiento = list(TIPOS_MOVIMIENTO)
+    if can_manage:
+        opciones_movimiento.append("Editar movimiento")
+
+    tipo = st.radio(
+        "¿Qué desea hacer?",
+        opciones_movimiento,
+        format_func=lambda x: _OPCIONES_LABEL.get(x, x),
+        horizontal=False,
+        help="Seleccione la operación. Si cometió un error en un registro existente, elija 'Editar movimiento'.",
+    )
+
+    if tipo == "Editar movimiento":
         render_movement_crud_controls(storage, data)
         return
 
@@ -3117,22 +3165,44 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
     st.markdown("</div>", unsafe_allow_html=True)
 
     mov_nonce = int(st.session_state.get("mov_form_nonce", 0))
+
+    # Explicación contextual según tipo de ajuste
+    if tipo == "Corrección entrada":
+        st.markdown(
+            "<div class='alert-green' style='margin-bottom:14px;'>"
+            "🔧 <b>Ajuste de entrada:</b> Se agregará una cantidad adicional al stock del lote seleccionado. "
+            "Use esto cuando el conteo físico muestra más unidades de las que indica el sistema. "
+            "Este ajuste crea un <b>nuevo movimiento</b>, no modifica el ingreso original."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            "<div class='alert-orange' style='margin-bottom:14px;'>"
+            "🔧 <b>Ajuste de salida:</b> Se descontará una cantidad del stock del lote seleccionado. "
+            "Use esto cuando el conteo físico muestra menos unidades de las que indica el sistema. "
+            "Este ajuste crea un <b>nuevo movimiento</b>, no modifica la salida original."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
     st.markdown("<div class='form-card'>", unsafe_allow_html=True)
     with st.form(f"frm_correccion_{mov_nonce}", clear_on_submit=True):
-        st.markdown("#### 2) Datos de corrección")
+        st.markdown("#### 2) Datos del ajuste")
         a, b, c = st.columns(3)
-        fecha = a.date_input("Fecha de corrección", value=TODAY.date())
-        usuario = b.text_input("Usuario que registra", value=st.session_state.get("nombre_usuario", "Usuario"))
-        cantidad = c.number_input("Cantidad", min_value=0.0, step=1.0, format="%.2f")
+        fecha = a.date_input("Fecha del ajuste", value=TODAY.date())
+        usuario = b.text_input("Registrado por", value=st.session_state.get("nombre_usuario", "Usuario"))
+        cantidad = c.number_input("Cantidad a ajustar", min_value=0.0, step=1.0, format="%.2f",
+                                  help="Ingrese solo la diferencia, no el total. Ej: si faltan 5 unidades, escriba 5.")
         d, e, f = st.columns(3)
         d.text_input("Producto", value=clean_str(selected["producto"]), disabled=True)
         e.text_input("Lote", value=clean_str(selected["lote"]), disabled=True)
         f.text_input("Unidad", value=clean_str(selected["unidad"]), disabled=True)
-        g, h = st.columns(2)
-        persona_relacionada = g.selectbox("Persona / sitio relacionado *", [""] + solicitantes["unidad_solicitante"].dropna().astype(str).sort_values().tolist())
-        personal = h.selectbox("Personal responsable *", [""] + personal_df["nombre"].dropna().astype(str).sort_values().tolist())
-        observacion = st.text_area("Justificación de la corrección *", placeholder="Explique la razón de la corrección para auditoría.")
-        submitted = st.form_submit_button("💾 Guardar corrección", use_container_width=True)
+        observacion = st.text_area(
+            "Justificación del ajuste *",
+            placeholder="Ej: diferencia encontrada en conteo físico del día 15/05/2026, lote verificado por bodeguero.",
+        )
+        submitted = st.form_submit_button("💾 Guardar ajuste de inventario", use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
     if submitted:
@@ -3143,16 +3213,10 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             st.error("La cantidad debe ser mayor a cero.")
             return
         if tipo == "Corrección salida" and cantidad > float(selected.get("stock_actual", 0) or 0):
-            st.error("La corrección de salida no puede superar el stock actual del lote.")
-            return
-        if not persona_relacionada:
-            st.error("Seleccione la persona o sitio relacionado con la corrección.")
-            return
-        if not personal:
-            st.error("Seleccione el personal responsable.")
+            st.error(f"No puede ajustar más de {float(selected.get('stock_actual', 0) or 0):g} unidades (stock actual del lote).")
             return
         if not observacion:
-            st.error("La justificación es obligatoria para registrar una corrección.")
+            st.error("La justificación es obligatoria para registrar un ajuste.")
             return
         row = {
             "movimiento_id": next_code("MOV", movimientos, "movimiento_id", 6),
@@ -3164,8 +3228,8 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             "lote": clean_str(selected["lote"]),
             "proveedor": "",
             "orden_compra": "",
-            "solicitante": persona_relacionada,
-            "personal": personal,
+            "solicitante": "",
+            "personal": clean_str(usuario),
             "fecha_elaboracion": "",
             "fecha_vencimiento": format_date(selected.get("fecha_vencimiento", "")),
             "unidad": clean_str(selected["unidad"]),
@@ -3177,7 +3241,7 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             "acta_entrega_id": "",
         }
         storage.append_row("Movimientos", row)
-        _sync_after_save([row], "Corrección guardada correctamente. El Kardex consolidado fue actualizado.")
+        _sync_after_save([row], "✅ Ajuste de inventario guardado. El stock y Kardex consolidado fueron actualizados.")
 
 def page_kardex_consolidado(kardex: pd.DataFrame, storage=None, data: Dict[str, pd.DataFrame] | None = None, mode: str = "") -> None:
     section_header(
