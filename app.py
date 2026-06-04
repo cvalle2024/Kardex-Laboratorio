@@ -64,7 +64,10 @@ SHEET_COLUMNS: Dict[str, List[str]] = {
     ],
     "Personal": [
         "personal_id", "nombre", "cargo", "correo", "activo",
-        "estado_registro", "creado_por", "fecha_creacion", "modificado_por", "fecha_modificacion", "motivo_modificacion"
+        "estado_registro", "creado_por", "fecha_creacion", "modificado_por", "fecha_modificacion", "motivo_modificacion",
+        # firma_b64 va SIEMPRE al final: la lectura de Google Sheets es posicional, por lo que
+        # agregar la columna al final mantiene alineadas todas las columnas previas en bases ya existentes.
+        "firma_b64"
     ],
     "Usuarios": [
         "usuario_id", "usuario", "nombre", "rol", "password_hash", "path_verificacion", "activo", "fecha_creacion"
@@ -1653,7 +1656,7 @@ def build_excel_report(data: Dict[str, pd.DataFrame], stock: pd.DataFrame, karde
         data["Productos"].to_excel(writer, index=False, sheet_name="Catalogo_Productos")
         data["Proveedores"].to_excel(writer, index=False, sheet_name="Catalogo_Proveedores")
         data["Solicitantes"].to_excel(writer, index=False, sheet_name="Catalogo_Solicitantes")
-        data["Personal"].to_excel(writer, index=False, sheet_name="Catalogo_Personal")
+        data["Personal"].drop(columns=["firma_b64"], errors="ignore").to_excel(writer, index=False, sheet_name="Catalogo_Personal")
         if "Permisos_Usuarios" in data:
             data["Permisos_Usuarios"].to_excel(writer, index=False, sheet_name="Permisos_Usuarios")
         if "Auditoria_Cambios" in data:
@@ -2486,6 +2489,61 @@ def next_movement_ids(df: pd.DataFrame, n: int) -> list[str]:
 
 
 
+def comprimir_firma_a_b64(file_or_bytes, max_width: int = 600) -> str:
+    """Normaliza una imagen de firma y la devuelve como PNG en base64 listo para guardar.
+
+    - Convierte a RGBA para conservar transparencia (firmas en PNG sin fondo).
+    - Redimensiona a un ancho máximo razonable para no exceder el límite de celda de
+      Google Sheets (~50.000 caracteres) ni inflar la base.
+    - Devuelve "" si la imagen no se puede procesar.
+    """
+    try:
+        from PIL import Image as PILImage
+    except Exception:
+        # Sin Pillow no se puede comprimir; se guarda el original si es pequeño.
+        try:
+            raw = file_or_bytes.read() if hasattr(file_or_bytes, "read") else bytes(file_or_bytes)
+            b64 = base64.b64encode(raw).decode("ascii")
+            return b64 if len(b64) <= 48000 else ""
+        except Exception:
+            return ""
+
+    try:
+        if hasattr(file_or_bytes, "read"):
+            raw = file_or_bytes.read()
+        else:
+            raw = bytes(file_or_bytes)
+        img = PILImage.open(BytesIO(raw))
+        img = img.convert("RGBA")
+        if img.width > max_width:
+            ratio = max_width / float(img.width)
+            img = img.resize((max_width, max(1, int(img.height * ratio))), PILImage.LANCZOS)
+        out = BytesIO()
+        img.save(out, format="PNG", optimize=True)
+        b64 = base64.b64encode(out.getvalue()).decode("ascii")
+        # Si aún supera el límite de celda, se reintenta con un ancho menor.
+        if len(b64) > 48000 and img.width > 320:
+            ratio = 320 / float(img.width)
+            img = img.resize((320, max(1, int(img.height * ratio))), PILImage.LANCZOS)
+            out = BytesIO()
+            img.save(out, format="PNG", optimize=True)
+            b64 = base64.b64encode(out.getvalue()).decode("ascii")
+        return b64 if len(b64) <= 48000 else ""
+    except Exception:
+        return ""
+
+
+def firma_b64_a_bytes(firma_b64: str) -> bytes | None:
+    """Decodifica una firma base64 a bytes PNG. Devuelve None si está vacía o es inválida."""
+    firma_b64 = clean_str(firma_b64)
+    if not firma_b64:
+        return None
+    try:
+        return base64.b64decode(firma_b64)
+    except Exception:
+        return None
+
+
 def resolve_acta_logo_path() -> Path | None:
     """Devuelve una ruta local válida para el logo PNG del acta.
 
@@ -2599,6 +2657,7 @@ def build_acta_entrega_pdf(
     ciudad: str = "Tegucigalpa",
     observacion: str = "",
     tipo_entrega_texto: str = "",
+    firma_entrega_b64: str = "",
 ) -> bytes:
     """Genera acta de entrega en PDF basada en el diseño del acta de referencia.
 
@@ -2710,19 +2769,49 @@ def build_acta_entrega_pdf(
     story.append(table)
     story.append(Spacer(1, 0.40 * inch))
 
+    # Celda de la firma de quien ENTREGA: si el personal tiene firma registrada,
+    # se inserta la imagen sobre la línea; si no, se deja la línea en blanco.
+    firma_entrega_cell = "____________________________"
+    tiene_firma_img = False
+    firma_bytes = firma_b64_a_bytes(firma_entrega_b64)
+    if firma_bytes:
+        try:
+            from reportlab.lib.utils import ImageReader
+            iw, ih = ImageReader(BytesIO(firma_bytes)).getSize()
+            aspect = (ih / iw) if iw else 0.35
+            max_w = 1.9 * inch
+            max_h = 0.75 * inch
+            target_w = max_w
+            target_h = target_w * aspect
+            if target_h > max_h:
+                target_h = max_h
+                target_w = target_h / aspect if aspect else max_w
+            # IMPORTANTE: reportlab Image debe recibir un archivo/BytesIO, no un ImageReader.
+            firma_img = Image(BytesIO(firma_bytes), width=target_w, height=target_h, hAlign="CENTER")
+            firma_entrega_cell = firma_img
+            tiene_firma_img = True
+        except Exception:
+            firma_entrega_cell = "____________________________"
+            tiene_firma_img = False
+
     firma_table = Table([
-        ["____________________________", "____________________________"],
+        [firma_entrega_cell, "____________________________"],
         [Paragraph("<b>Entregué conforme</b>", small_center), Paragraph("<b>Recibí conforme</b>", small_center)],
         [Paragraph(f"<b>{entrega_nombre}</b>", small_center), Paragraph(f"<b>{recibe_nombre}</b>", small_center)],
         [Paragraph(entrega_cargo, small_center), Paragraph(recibe_cargo, small_center)],
         [Paragraph("Programa VIHCA<br/>Asociado al Centro de Estudios en Salud, de la<br/>Universidad del Valle de Guatemala", small_center), Paragraph(sitio, small_center)],
-    ], colWidths=[3.25 * inch, 3.25 * inch])
-    firma_table.setStyle(TableStyle([
+    ], colWidths=[3.25 * inch, 3.25 * inch], rowHeights=[0.80 * inch, None, None, None, None])
+    firma_style = [
         ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("VALIGN", (0, 0), (-1, 0), "BOTTOM"),
+        ("VALIGN", (0, 1), (-1, -1), "TOP"),
         ("TOPPADDING", (0, 0), (-1, -1), 2),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-    ]))
+    ]
+    if tiene_firma_img:
+        # Línea de firma debajo de la imagen para mantener el formato del acta.
+        firma_style.append(("LINEBELOW", (0, 0), (0, 0), 1.0, colors.black))
+    firma_table.setStyle(TableStyle(firma_style))
     story.append(firma_table)
     story.append(Spacer(1, 0.35 * inch))
 
@@ -2738,6 +2827,130 @@ def build_acta_entrega_pdf(
 
     doc.build(story)
     return buffer.getvalue()
+
+
+def hay_acta_pendiente_descarga() -> bool:
+    """True si existe un acta generada que todavía no fue descargada por el usuario."""
+    return bool(st.session_state.get("last_acta_pdf")) and not st.session_state.get("last_acta_descargada", True)
+
+
+def _boton_guardar_como(pdf_bytes: bytes, filename: str) -> None:
+    """Botón 'Guardar como…' que abre el selector nativo de carpeta en Chrome/Edge.
+
+    Usa la File System Access API (window.showSaveFilePicker). Si el navegador no la
+    soporta o el iframe la bloquea, hace una descarga normal a la carpeta predeterminada.
+    """
+    try:
+        import streamlit.components.v1 as components
+    except Exception:
+        return
+    b64 = base64.b64encode(pdf_bytes).decode("ascii")
+    safe_name = filename.replace("\\", "_").replace('"', "")
+    html = f"""
+    <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;">
+      <button id="btnSaveAs" style="width:100%;cursor:pointer;border:0;border-radius:10px;
+              padding:11px 14px;font-size:14px;font-weight:700;color:#fff;
+              background:linear-gradient(90deg,#0EA5E9,#2563EB);">
+        💾 Guardar acta como… (elegir carpeta)
+      </button>
+      <div id="saveMsg" style="margin-top:6px;font-size:12px;color:#94A3B8;"></div>
+    </div>
+    <script>
+      const _b64 = "{b64}";
+      const _name = "{safe_name}";
+      function _toBlob(b64, type) {{
+        const bin = atob(b64); const len = bin.length; const arr = new Uint8Array(len);
+        for (let i=0;i<len;i++) arr[i] = bin.charCodeAt(i);
+        return new Blob([arr], {{type}});
+      }}
+      async function _guardarComo() {{
+        const msg = document.getElementById('saveMsg');
+        const blob = _toBlob(_b64, 'application/pdf');
+        if (window.showSaveFilePicker) {{
+          try {{
+            const handle = await window.showSaveFilePicker({{
+              suggestedName: _name,
+              types: [{{description:'PDF', accept:{{'application/pdf':['.pdf']}}}}]
+            }});
+            const w = await handle.createWritable();
+            await w.write(blob); await w.close();
+            msg.textContent = '✅ Acta guardada en la carpeta que elegiste.';
+            return;
+          }} catch (e) {{
+            if (e && e.name === 'AbortError') {{ msg.textContent = 'Guardado cancelado.'; return; }}
+            // Si el navegador bloquea la API dentro del iframe, se usa descarga normal.
+          }}
+        }}
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = _name; document.body.appendChild(a); a.click(); a.remove();
+        URL.revokeObjectURL(url);
+        msg.textContent = 'Descarga iniciada en la carpeta predeterminada del navegador.';
+      }}
+      document.getElementById('btnSaveAs').addEventListener('click', _guardarComo);
+    </script>
+    """
+    components.html(html, height=78)
+
+
+def render_acta_download_panel(*, bloqueo: bool = False) -> None:
+    """Muestra el panel de descarga del acta.
+
+    - El botón nativo de Streamlit marca el acta como descargada (destraba el bloqueo).
+    - El botón 'Guardar como…' permite elegir la carpeta (Chrome/Edge).
+    - Se explica cómo activar 'Preguntar dónde guardar' para elegir carpeta en cualquier navegador.
+    """
+    pdf_bytes = st.session_state.get("last_acta_pdf")
+    if not pdf_bytes:
+        return
+    filename = st.session_state.get("last_acta_filename", "acta_entrega.pdf")
+    acta_id = st.session_state.get("last_acta_id", "")
+
+    if bloqueo:
+        st.markdown(
+            f"""<div style="border:1.5px solid #F59E0B; background:rgba(245,158,11,.10);
+                    border-radius:14px; padding:14px 16px; margin:6px 0 12px 0;">
+                <div style="font-size:15px; font-weight:800; color:#F59E0B;">⚠️ Acta pendiente de descarga</div>
+                <div style="font-size:13px; color:#CBD5E1; margin-top:4px;">
+                    La salida se registró correctamente y se generó el acta <b>{acta_id}</b>.
+                    Para evitar perderla, <b>debe descargar el acta antes de continuar</b>.
+                    No podrá registrar una nueva salida hasta descargarla.
+                </div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        descargada = st.download_button(
+            "⬇️ Descargar acta (PDF)",
+            data=pdf_bytes,
+            file_name=filename,
+            mime="application/pdf",
+            use_container_width=True,
+            key=f"dl_acta_{acta_id or 'na'}",
+            type="primary" if bloqueo else "secondary",
+        )
+    with c2:
+        _boton_guardar_como(pdf_bytes, filename)
+
+    if descargada:
+        st.session_state["last_acta_descargada"] = True
+        if bloqueo:
+            set_flash("Acta descargada. Ya puede registrar una nueva salida.", "success")
+        rerun()
+
+    with st.expander("📁 ¿Cómo elegir en qué carpeta se descarga el acta?"):
+        st.markdown(
+            "**Opción A — elegir carpeta cada vez (recomendada, cualquier navegador):**\n"
+            "1. Abra la configuración de su navegador → **Descargas**.\n"
+            "2. Active **«Preguntar dónde guardar cada archivo antes de descargarlo»**.\n"
+            "3. A partir de ahí, al usar **⬇️ Descargar acta** el navegador le pedirá la carpeta.\n\n"
+            "**Opción B — botón «Guardar como…»:** en **Chrome o Edge** abre directamente el "
+            "selector de carpeta. En otros navegadores hace una descarga normal.\n\n"
+            "_Nota técnica: una aplicación web no puede fijar por sí sola la carpeta de destino; "
+            "la elige el navegador. Por eso se usan estas dos vías._"
+        )
 
 
 def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame) -> None:
@@ -3027,6 +3240,15 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
     # SALIDA CON CARRITO
     # ========================================================
     if tipo == "Salida":
+        # ── BLOQUEO: si hay un acta generada y aún no descargada, se obliga a descargarla
+        # antes de permitir registrar una nueva salida. El acta queda guardada temporalmente
+        # en la sesión, así que no se pierde aunque el usuario haya olvidado descargarla.
+        if hay_acta_pendiente_descarga():
+            st.markdown("<div class='form-card'>", unsafe_allow_html=True)
+            render_acta_download_panel(bloqueo=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+            return
+
         st.markdown("<div class='form-card'>", unsafe_allow_html=True)
         st.markdown("#### 1) Armar carrito de salida")
         disponibles = stock[stock["stock_actual"] > 0].copy() if not stock.empty else pd.DataFrame()
@@ -3172,14 +3394,13 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             st.info("Agregue uno o varios productos al carrito. Al guardar la salida, cada producto se registrará como una fila individual en Movimientos.")
         st.markdown("</div>", unsafe_allow_html=True)
 
+        # Panel de la última acta generada (sin bloqueo: aquí ya no hay acta pendiente,
+        # porque el bloqueo de arriba retorna antes de llegar a este punto).
         if st.session_state.get("last_acta_pdf"):
-            st.download_button(
-                "📄 Descargar última acta de entrega generada",
-                data=st.session_state["last_acta_pdf"],
-                file_name=st.session_state.get("last_acta_filename", "acta_entrega.pdf"),
-                mime="application/pdf",
-                use_container_width=True,
-            )
+            st.markdown("<div class='form-card'>", unsafe_allow_html=True)
+            st.markdown("##### 📄 Última acta de entrega generada")
+            render_acta_download_panel(bloqueo=False)
+            st.markdown("</div>", unsafe_allow_html=True)
 
         mov_nonce = int(st.session_state.get("mov_form_nonce", 0))
 
@@ -3372,10 +3593,17 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             storage.append_rows("Movimientos", rows)
             if generar_acta:
                 personal_info = get_first_match(personal_df, "nombre", personal)
-                pdf_bytes = build_acta_entrega_pdf(rows, solicitante_info, personal_info, fecha, recibe_nombre, recibe_cargo, observacion=observacion, tipo_entrega_texto=tipo_entrega_texto)
+                firma_entrega_b64 = clean_str(personal_info.get("firma_b64", ""))
+                pdf_bytes = build_acta_entrega_pdf(
+                    rows, solicitante_info, personal_info, fecha, recibe_nombre, recibe_cargo,
+                    observacion=observacion, tipo_entrega_texto=tipo_entrega_texto,
+                    firma_entrega_b64=firma_entrega_b64,
+                )
                 st.session_state["last_acta_pdf"] = pdf_bytes
                 st.session_state["last_acta_filename"] = f"acta_entrega_{acta_id}_{clean_str(solicitante).replace(' ', '_')}.pdf"
                 st.session_state["last_acta_id"] = acta_id
+                # Marca el acta como NO descargada → activa el bloqueo hasta que el usuario la descargue.
+                st.session_state["last_acta_descargada"] = False
             st.session_state["salida_cart"] = []
             _sync_after_save(rows, f"Salida guardada correctamente: {len(rows)} insumo(s) registrados individualmente. Acta: {acta_id}.")
         return
@@ -3973,6 +4201,131 @@ def staff_form(storage, data: Dict[str, pd.DataFrame]) -> None:
         rerun()
 
 
+def _guardar_firma_personal(storage, data: Dict[str, pd.DataFrame], personal_id: str, firma_b64: str) -> None:
+    """Actualiza la firma de una persona en la hoja Personal y registra auditoría."""
+    df = ensure_columns(data["Personal"], "Personal")
+    mask = df["personal_id"].astype(str) == str(personal_id)
+    if not mask.any():
+        st.error("No se encontró el registro de personal seleccionado.")
+        return
+    old_tiene = "Sí" if clean_str(df.loc[mask, "firma_b64"].iloc[0]) else "No"
+    df.loc[mask, "firma_b64"] = firma_b64
+    if "modificado_por" in df.columns:
+        df.loc[mask, "modificado_por"] = current_username()
+    if "fecha_modificacion" in df.columns:
+        df.loc[mask, "fecha_modificacion"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    storage.save("Personal", ensure_columns(df, "Personal"))
+    append_audit_rows(storage, [{
+        "auditoria_id": f"AUD-{uuid.uuid4().hex[:12].upper()}",
+        "fecha_evento": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "usuario": current_username(),
+        "rol": current_role(),
+        "accion": "ACTUALIZAR_FIRMA" if firma_b64 else "ELIMINAR_FIRMA",
+        "modulo": "Personal",
+        "registro_id": str(personal_id),
+        "campo": "firma_b64",
+        "valor_anterior": f"Firma registrada: {old_tiene}",
+        "valor_nuevo": "Firma registrada: Sí" if firma_b64 else "Firma registrada: No",
+        "motivo": "Gestión de firma digital para acta de entrega",
+        "detalle": "Carga/actualización de firma del personal que entrega",
+    }])
+    set_flash("Firma guardada correctamente." if firma_b64 else "Firma eliminada correctamente.")
+    rerun()
+
+
+def staff_signature_manager(storage, data: Dict[str, pd.DataFrame]) -> None:
+    """Carga/dibuja la firma del personal que entrega. Se inserta en el acta ('Entregué conforme')."""
+    card_start(
+        "✍️ Firma del personal que entrega",
+        "Cargue (o dibuje) la firma de cada persona. Se insertará automáticamente en el acta de entrega, "
+        "en el espacio «Entregué conforme», cuando esa persona registre una salida."
+    )
+    if not user_has_permission(data, "editar_personal"):
+        st.info("Para gestionar firmas necesita permiso de edición de personal.")
+        return
+
+    df = ensure_columns(data["Personal"], "Personal")
+    activos = df[active_mask(df)]
+    if activos.empty:
+        st.info("Primero registre personal activo para asignarle una firma.")
+        return
+
+    nombres = activos["nombre"].dropna().astype(str).sort_values().tolist()
+    sel_nombre = st.selectbox("Personal", [""] + nombres, key="firma_sel_personal")
+    if not sel_nombre:
+        st.caption("Seleccione una persona para cargar o actualizar su firma.")
+        return
+
+    fila = get_first_match(activos, "nombre", sel_nombre)
+    personal_id = clean_str(fila.get("personal_id", ""))
+    firma_actual = clean_str(fila.get("firma_b64", ""))
+
+    if firma_actual:
+        firma_bytes = firma_b64_a_bytes(firma_actual)
+        if firma_bytes:
+            st.markdown("**Firma actual:**")
+            st.image(firma_bytes, width=260)
+        if st.button("🗑️ Quitar firma de esta persona", key="firma_quitar"):
+            _guardar_firma_personal(storage, data, personal_id, "")
+    else:
+        st.info("Esta persona aún no tiene una firma registrada.")
+
+    # Método de captura: subir imagen siempre disponible; dibujar solo si la librería está instalada.
+    try:
+        from streamlit_drawable_canvas import st_canvas  # opcional
+        canvas_disponible = True
+    except Exception:
+        canvas_disponible = False
+
+    metodos = ["Subir imagen"] + (["Dibujar firma"] if canvas_disponible else [])
+    metodo = st.radio("¿Cómo desea registrar la firma?", metodos, horizontal=True, key="firma_metodo")
+
+    if metodo == "Subir imagen":
+        st.caption("Recomendado: PNG con fondo transparente. También se aceptan JPG/JPEG. La imagen se ajusta automáticamente.")
+        archivo = st.file_uploader("Imagen de la firma", type=["png", "jpg", "jpeg"], key="firma_uploader")
+        if archivo is not None:
+            nueva_b64 = comprimir_firma_a_b64(archivo)
+            if not nueva_b64:
+                st.error("No se pudo procesar la imagen (puede ser muy grande). Use una firma más pequeña o en PNG.")
+            else:
+                st.markdown("**Vista previa:**")
+                st.image(firma_b64_a_bytes(nueva_b64), width=260)
+                if st.button("💾 Guardar firma", key="firma_guardar_upload", type="primary"):
+                    _guardar_firma_personal(storage, data, personal_id, nueva_b64)
+
+    elif metodo == "Dibujar firma":
+        from streamlit_drawable_canvas import st_canvas
+        st.caption("Dibuje la firma con el mouse o el dedo (pantalla táctil) y luego guárdela.")
+        canvas = st_canvas(
+            fill_color="rgba(0,0,0,0)",
+            stroke_width=3,
+            stroke_color="#111111",
+            background_color="#FFFFFF",
+            height=160,
+            width=460,
+            drawing_mode="freedraw",
+            key="firma_canvas",
+        )
+        if st.button("💾 Guardar firma dibujada", key="firma_guardar_canvas", type="primary"):
+            if canvas is None or canvas.image_data is None:
+                st.error("Primero dibuje la firma en el recuadro.")
+            else:
+                try:
+                    from PIL import Image as PILImage
+                    import numpy as _np
+                    arr = canvas.image_data.astype("uint8")
+                    img = PILImage.fromarray(arr, mode="RGBA")
+                    buf = BytesIO()
+                    img.save(buf, format="PNG")
+                    nueva_b64 = comprimir_firma_a_b64(buf.getvalue())
+                    if nueva_b64:
+                        _guardar_firma_personal(storage, data, personal_id, nueva_b64)
+                    else:
+                        st.error("No se pudo procesar la firma dibujada.")
+                except Exception as exc:
+                    st.error(f"No se pudo guardar la firma dibujada: {exc}")
+
+
 def catalog_editor(storage, data: Dict[str, pd.DataFrame], sheet: str, title: str) -> None:
     """CRUD controlado de catálogos.
 
@@ -3991,7 +4344,12 @@ def catalog_editor(storage, data: Dict[str, pd.DataFrame], sheet: str, title: st
         mask = view.astype(str).apply(lambda col: col.str.contains(search, case=False, na=False)).any(axis=1)
         view = view[mask]
 
-    st.dataframe(view, use_container_width=True, hide_index=True)
+    # No mostrar la cadena base64 de la firma en la tabla: se reemplaza por un indicador.
+    view_display = view.copy()
+    if "firma_b64" in view_display.columns:
+        view_display["firma_b64"] = view_display["firma_b64"].apply(lambda x: "✔ Registrada" if clean_str(x) else "—")
+        view_display = view_display.rename(columns={"firma_b64": "firma"})
+    st.dataframe(view_display, use_container_width=True, hide_index=True)
 
     can_edit = user_has_permission(data, f"editar_{base}")
     can_deactivate = user_has_permission(data, f"desactivar_{base}")
@@ -4011,7 +4369,7 @@ def catalog_editor(storage, data: Dict[str, pd.DataFrame], sheet: str, title: st
 
     editable_cols = [
         c for c in SHEET_COLUMNS[sheet]
-        if c not in {id_col, "creado_por", "fecha_creacion", "modificado_por", "fecha_modificacion", "motivo_modificacion"}
+        if c not in {id_col, "creado_por", "fecha_creacion", "modificado_por", "fecha_modificacion", "motivo_modificacion", "firma_b64"}
     ]
     values = {}
     with st.form(f"frm_crud_{sheet}_{registro_id}"):
@@ -4143,6 +4501,7 @@ def page_catalogos(storage, data: Dict[str, pd.DataFrame]) -> None:
             staff_form(storage, data)
         else:
             st.info("Puede consultar personal. Para crear personal solicite permiso al administrador.")
+        staff_signature_manager(storage, data)
         catalog_editor(storage, data, "Personal", "Listado de personal")
 
 
