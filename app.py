@@ -2532,6 +2532,28 @@ def comprimir_firma_a_b64(file_or_bytes, max_width: int = 600) -> str:
             return ""
         img = PILImage.open(BytesIO(raw))
         img = img.convert("RGBA")
+        # Recorta el borde transparente/blanco para que la firma llene el recuadro (se vea más grande).
+        try:
+            from PIL import ImageChops
+            alpha = img.split()[-1]
+            if alpha.getextrema()[0] < 255:
+                # Imagen con transparencia: recorta por el canal alfa.
+                bbox = alpha.getbbox()
+            else:
+                # Imagen opaca: recorta lo que difiera del blanco.
+                rgb = img.convert("RGB")
+                fondo = PILImage.new("RGB", rgb.size, (255, 255, 255))
+                bbox = ImageChops.difference(rgb, fondo).getbbox()
+            if bbox:
+                # Pequeño margen para que el trazo no quede pegado al borde.
+                pad = 6
+                x0 = max(0, bbox[0] - pad)
+                y0 = max(0, bbox[1] - pad)
+                x1 = min(img.width, bbox[2] + pad)
+                y1 = min(img.height, bbox[3] + pad)
+                img = img.crop((x0, y0, x1, y1))
+        except Exception:
+            pass
         if img.width > max_width:
             ratio = max_width / float(img.width)
             img = img.resize((max_width, max(1, int(img.height * ratio))), PILImage.LANCZOS)
@@ -2806,8 +2828,8 @@ def build_acta_entrega_pdf(
             from reportlab.lib.utils import ImageReader
             iw, ih = ImageReader(BytesIO(firma_bytes)).getSize()
             aspect = (ih / iw) if iw else 0.35
-            max_w = 1.9 * inch
-            max_h = 0.75 * inch
+            max_w = 2.7 * inch
+            max_h = 1.05 * inch
             target_w = max_w
             target_h = target_w * aspect
             if target_h > max_h:
@@ -2827,7 +2849,7 @@ def build_acta_entrega_pdf(
         [Paragraph(f"<b>{entrega_nombre}</b>", small_center), Paragraph(f"<b>{recibe_nombre}</b>", small_center)],
         [Paragraph(entrega_cargo, small_center), Paragraph(recibe_cargo, small_center)],
         [Paragraph("Programa VIHCA<br/>Asociado al Centro de Estudios en Salud, de la<br/>Universidad del Valle de Guatemala", small_center), Paragraph(sitio, small_center)],
-    ], colWidths=[3.25 * inch, 3.25 * inch], rowHeights=[0.80 * inch, None, None, None, None])
+    ], colWidths=[3.25 * inch, 3.25 * inch], rowHeights=[1.10 * inch, None, None, None, None])
     firma_style = [
         ("ALIGN", (0, 0), (-1, -1), "CENTER"),
         ("VALIGN", (0, 0), (-1, 0), "BOTTOM"),
