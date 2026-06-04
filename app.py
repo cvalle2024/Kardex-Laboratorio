@@ -136,6 +136,7 @@ PERMISSION_LABELS = {
     "crear_personal": "Crear personal",
     "editar_personal": "Editar personal",
     "desactivar_personal": "Desactivar/reactivar personal",
+    "gestionar_firmas": "Gestionar firmas del personal (para actas)",
     "registrar_movimientos": "Registrar ingresos, salidas, devoluciones y correcciones",
     "anular_movimientos": "Anular movimientos",
     "editar_movimientos": "Editar datos administrativos de movimientos",
@@ -155,11 +156,13 @@ ROLE_DEFAULT_PERMISSIONS = {
     "Supervisor": {
         "crear_productos", "crear_proveedores", "crear_solicitantes", "crear_personal",
         "editar_productos", "editar_proveedores", "editar_solicitantes", "editar_personal",
+        "gestionar_firmas",
         "registrar_movimientos", "anular_movimientos", "editar_movimientos",
         "exportar_reportes", "ver_auditoria",
     },
     "Operador": {
         "crear_productos", "crear_proveedores", "crear_solicitantes", "crear_personal",
+        "gestionar_firmas",
         "registrar_movimientos", "exportar_reportes",
     },
     "Consulta": {"exportar_reportes"},
@@ -2502,17 +2505,34 @@ def comprimir_firma_a_b64(file_or_bytes, max_width: int = 600) -> str:
     except Exception:
         # Sin Pillow no se puede comprimir; se guarda el original si es pequeño.
         try:
-            raw = file_or_bytes.read() if hasattr(file_or_bytes, "read") else bytes(file_or_bytes)
+            if hasattr(file_or_bytes, "getvalue"):
+                raw = file_or_bytes.getvalue()
+            elif hasattr(file_or_bytes, "read"):
+                try:
+                    file_or_bytes.seek(0)
+                except Exception:
+                    pass
+                raw = file_or_bytes.read()
+            else:
+                raw = bytes(file_or_bytes)
             b64 = base64.b64encode(raw).decode("ascii")
             return b64 if len(b64) <= 48000 else ""
         except Exception:
             return ""
 
     try:
-        if hasattr(file_or_bytes, "read"):
+        if hasattr(file_or_bytes, "getvalue"):
+            raw = file_or_bytes.getvalue()
+        elif hasattr(file_or_bytes, "read"):
+            try:
+                file_or_bytes.seek(0)
+            except Exception:
+                pass
             raw = file_or_bytes.read()
         else:
             raw = bytes(file_or_bytes)
+        if not raw:
+            return ""
         img = PILImage.open(BytesIO(raw))
         img = img.convert("RGBA")
         if img.width > max_width:
@@ -4240,8 +4260,8 @@ def staff_signature_manager(storage, data: Dict[str, pd.DataFrame]) -> None:
         "Cargue (o dibuje) la firma de cada persona. Se insertará automáticamente en el acta de entrega, "
         "en el espacio «Entregué conforme», cuando esa persona registre una salida."
     )
-    if not user_has_permission(data, "editar_personal"):
-        st.info("Para gestionar firmas necesita permiso de edición de personal.")
+    if not (user_has_permission(data, "gestionar_firmas") or user_has_permission(data, "editar_personal")):
+        st.info("Para gestionar firmas necesita el permiso «Gestionar firmas del personal» (o «Editar personal»).")
         return
 
     df = ensure_columns(data["Personal"], "Personal")
@@ -4284,7 +4304,8 @@ def staff_signature_manager(storage, data: Dict[str, pd.DataFrame]) -> None:
         st.caption("Recomendado: PNG con fondo transparente. También se aceptan JPG/JPEG. La imagen se ajusta automáticamente.")
         archivo = st.file_uploader("Imagen de la firma", type=["png", "jpg", "jpeg"], key="firma_uploader")
         if archivo is not None:
-            nueva_b64 = comprimir_firma_a_b64(archivo)
+            # getvalue() devuelve los bytes sin importar la posición del puntero (evita lecturas vacías al recargar).
+            nueva_b64 = comprimir_firma_a_b64(archivo.getvalue())
             if not nueva_b64:
                 st.error("No se pudo procesar la imagen (puede ser muy grande). Use una firma más pequeña o en PNG.")
             else:
