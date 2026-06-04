@@ -64,10 +64,7 @@ SHEET_COLUMNS: Dict[str, List[str]] = {
     ],
     "Personal": [
         "personal_id", "nombre", "cargo", "correo", "activo",
-        "estado_registro", "creado_por", "fecha_creacion", "modificado_por", "fecha_modificacion", "motivo_modificacion",
-        # firma_b64 va SIEMPRE al final: la lectura de Google Sheets es posicional, por lo que
-        # agregar la columna al final mantiene alineadas todas las columnas previas en bases ya existentes.
-        "firma_b64"
+        "estado_registro", "creado_por", "fecha_creacion", "modificado_por", "fecha_modificacion", "motivo_modificacion"
     ],
     "Usuarios": [
         "usuario_id", "usuario", "nombre", "rol", "password_hash", "path_verificacion", "activo", "fecha_creacion"
@@ -2564,6 +2561,16 @@ def firma_b64_a_bytes(firma_b64: str) -> bytes | None:
         return None
 
 
+def firma_config_key(personal_id: str) -> str:
+    """Clave en la hoja Config donde se guarda la firma de una persona.
+
+    Se usa Config (clave/valor) en lugar de una columna nueva en Personal porque,
+    sobre Google Sheets, agregar una columna a una hoja existente es frágil (ancho de
+    cuadrícula y mapeo posicional). En Config la firma va en una sola celda existente.
+    """
+    return f"firma_personal::{clean_str(personal_id)}"
+
+
 def resolve_acta_logo_path() -> Path | None:
     """Devuelve una ruta local válida para el logo PNG del acta.
 
@@ -3613,7 +3620,7 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             storage.append_rows("Movimientos", rows)
             if generar_acta:
                 personal_info = get_first_match(personal_df, "nombre", personal)
-                firma_entrega_b64 = clean_str(personal_info.get("firma_b64", ""))
+                firma_entrega_b64 = get_firma_personal(data, personal_info.get("personal_id", ""))
                 pdf_bytes = build_acta_entrega_pdf(
                     rows, solicitante_info, personal_info, fecha, recibe_nombre, recibe_cargo,
                     observacion=observacion, tipo_entrega_texto=tipo_entrega_texto,
@@ -4221,25 +4228,35 @@ def staff_form(storage, data: Dict[str, pd.DataFrame]) -> None:
         rerun()
 
 
-def _guardar_firma_personal(storage, data: Dict[str, pd.DataFrame], personal_id: str, firma_b64: str) -> bool:
-    """Actualiza la firma de una persona en la hoja Personal. Devuelve True si guardó.
+def get_firma_personal(data: Dict[str, pd.DataFrame], personal_id: str) -> str:
+    """Devuelve la firma base64 de una persona almacenada en Config (o "")."""
+    personal_id = clean_str(personal_id)
+    if not personal_id:
+        return ""
+    return get_config_value(data, firma_config_key(personal_id), "")
 
-    No hace rerun ni set_flash: de eso se encarga quien llama, para poder limpiar el
-    uploader y mostrar un mensaje claro de éxito/fallo.
+
+def _guardar_firma_personal(storage, data: Dict[str, pd.DataFrame], personal_id: str, firma_b64: str) -> bool:
+    """Guarda/borra la firma de una persona en la hoja Config. Devuelve True si guardó.
+
+    La firma se almacena como clave/valor en Config (clave = firma_personal::<id>),
+    evitando los problemas de agregar una columna nueva a la hoja Personal en Google
+    Sheets. No hace rerun: de eso se encarga quien llama.
     """
-    df = ensure_columns(data["Personal"], "Personal")
-    mask = df["personal_id"].astype(str) == str(personal_id)
-    if not mask.any():
-        st.error("No se encontró el registro de personal seleccionado (personal_id vacío o no coincide).")
+    personal_id = clean_str(personal_id)
+    if not personal_id:
+        st.error("No se pudo identificar a la persona (personal_id vacío). Revise el registro en el catálogo de Personal.")
         return False
-    old_tiene = "Sí" if clean_str(df.loc[mask, "firma_b64"].iloc[0]) else "No"
-    df.loc[mask, "firma_b64"] = firma_b64
-    if "modificado_por" in df.columns:
-        df.loc[mask, "modificado_por"] = current_username()
-    if "fecha_modificacion" in df.columns:
-        df.loc[mask, "fecha_modificacion"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
-        storage.save("Personal", ensure_columns(df, "Personal"))
+        set_config_value(storage, data, firma_config_key(personal_id), firma_b64)
+        # Refleja el cambio en el snapshot en memoria para esta misma ejecución.
+        cfg = ensure_columns(data.get("Config", pd.DataFrame()), "Config")
+        key = firma_config_key(personal_id)
+        if (cfg["clave"].astype(str) == key).any():
+            cfg.loc[cfg["clave"].astype(str) == key, "valor"] = firma_b64
+        else:
+            cfg = pd.concat([cfg, pd.DataFrame([{"clave": key, "valor": firma_b64}])], ignore_index=True)
+        data["Config"] = cfg
     except Exception as exc:
         st.error(f"No se pudo guardar la firma en la base de datos. Detalle: {exc}")
         return False
@@ -4251,12 +4268,12 @@ def _guardar_firma_personal(storage, data: Dict[str, pd.DataFrame], personal_id:
             "rol": current_role(),
             "accion": "ACTUALIZAR_FIRMA" if firma_b64 else "ELIMINAR_FIRMA",
             "modulo": "Personal",
-            "registro_id": str(personal_id),
-            "campo": "firma_b64",
-            "valor_anterior": f"Firma registrada: {old_tiene}",
+            "registro_id": personal_id,
+            "campo": "firma",
+            "valor_anterior": "",
             "valor_nuevo": "Firma registrada: Sí" if firma_b64 else "Firma registrada: No",
             "motivo": "Gestión de firma digital para acta de entrega",
-            "detalle": "Carga/actualización de firma del personal que entrega",
+            "detalle": "Carga/actualización de firma del personal que entrega (Config)",
         }])
     except Exception:
         # La auditoría es secundaria: si falla, la firma ya quedó guardada.
@@ -4295,7 +4312,7 @@ def staff_signature_manager(storage, data: Dict[str, pd.DataFrame]) -> None:
 
     fila = get_first_match(activos, "nombre", sel_nombre)
     personal_id = clean_str(fila.get("personal_id", ""))
-    firma_actual = clean_str(fila.get("firma_b64", ""))
+    firma_actual = get_firma_personal(data, personal_id)
 
     col_a, col_b = st.columns([1, 1])
     with col_a:
