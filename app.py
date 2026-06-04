@@ -4221,36 +4221,48 @@ def staff_form(storage, data: Dict[str, pd.DataFrame]) -> None:
         rerun()
 
 
-def _guardar_firma_personal(storage, data: Dict[str, pd.DataFrame], personal_id: str, firma_b64: str) -> None:
-    """Actualiza la firma de una persona en la hoja Personal y registra auditoría."""
+def _guardar_firma_personal(storage, data: Dict[str, pd.DataFrame], personal_id: str, firma_b64: str) -> bool:
+    """Actualiza la firma de una persona en la hoja Personal. Devuelve True si guardó.
+
+    No hace rerun ni set_flash: de eso se encarga quien llama, para poder limpiar el
+    uploader y mostrar un mensaje claro de éxito/fallo.
+    """
     df = ensure_columns(data["Personal"], "Personal")
     mask = df["personal_id"].astype(str) == str(personal_id)
     if not mask.any():
-        st.error("No se encontró el registro de personal seleccionado.")
-        return
+        st.error("No se encontró el registro de personal seleccionado (personal_id vacío o no coincide).")
+        return False
     old_tiene = "Sí" if clean_str(df.loc[mask, "firma_b64"].iloc[0]) else "No"
     df.loc[mask, "firma_b64"] = firma_b64
     if "modificado_por" in df.columns:
         df.loc[mask, "modificado_por"] = current_username()
     if "fecha_modificacion" in df.columns:
         df.loc[mask, "fecha_modificacion"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-    storage.save("Personal", ensure_columns(df, "Personal"))
-    append_audit_rows(storage, [{
-        "auditoria_id": f"AUD-{uuid.uuid4().hex[:12].upper()}",
-        "fecha_evento": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "usuario": current_username(),
-        "rol": current_role(),
-        "accion": "ACTUALIZAR_FIRMA" if firma_b64 else "ELIMINAR_FIRMA",
-        "modulo": "Personal",
-        "registro_id": str(personal_id),
-        "campo": "firma_b64",
-        "valor_anterior": f"Firma registrada: {old_tiene}",
-        "valor_nuevo": "Firma registrada: Sí" if firma_b64 else "Firma registrada: No",
-        "motivo": "Gestión de firma digital para acta de entrega",
-        "detalle": "Carga/actualización de firma del personal que entrega",
-    }])
-    set_flash("Firma guardada correctamente." if firma_b64 else "Firma eliminada correctamente.")
-    rerun()
+    try:
+        storage.save("Personal", ensure_columns(df, "Personal"))
+    except Exception as exc:
+        st.error(f"No se pudo guardar la firma en la base de datos. Detalle: {exc}")
+        return False
+    try:
+        append_audit_rows(storage, [{
+            "auditoria_id": f"AUD-{uuid.uuid4().hex[:12].upper()}",
+            "fecha_evento": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "usuario": current_username(),
+            "rol": current_role(),
+            "accion": "ACTUALIZAR_FIRMA" if firma_b64 else "ELIMINAR_FIRMA",
+            "modulo": "Personal",
+            "registro_id": str(personal_id),
+            "campo": "firma_b64",
+            "valor_anterior": f"Firma registrada: {old_tiene}",
+            "valor_nuevo": "Firma registrada: Sí" if firma_b64 else "Firma registrada: No",
+            "motivo": "Gestión de firma digital para acta de entrega",
+            "detalle": "Carga/actualización de firma del personal que entrega",
+        }])
+    except Exception:
+        # La auditoría es secundaria: si falla, la firma ya quedó guardada.
+        pass
+    mark_data_dirty()
+    return True
 
 
 def staff_signature_manager(storage, data: Dict[str, pd.DataFrame]) -> None:
@@ -4270,6 +4282,11 @@ def staff_signature_manager(storage, data: Dict[str, pd.DataFrame]) -> None:
         st.info("Primero registre personal activo para asignarle una firma.")
         return
 
+    # Mensaje de éxito persistente tras guardar (más visible que el toast).
+    okmsg = st.session_state.pop("firma_ok_msg", "")
+    if okmsg:
+        st.success(okmsg)
+
     nombres = activos["nombre"].dropna().astype(str).sort_values().tolist()
     sel_nombre = st.selectbox("Personal", [""] + nombres, key="firma_sel_personal")
     if not sel_nombre:
@@ -4280,15 +4297,24 @@ def staff_signature_manager(storage, data: Dict[str, pd.DataFrame]) -> None:
     personal_id = clean_str(fila.get("personal_id", ""))
     firma_actual = clean_str(fila.get("firma_b64", ""))
 
-    if firma_actual:
+    col_a, col_b = st.columns([1, 1])
+    with col_a:
+        st.markdown("**Estado actual de la firma**")
         firma_bytes = firma_b64_a_bytes(firma_actual)
         if firma_bytes:
-            st.markdown("**Firma actual:**")
-            st.image(firma_bytes, width=260)
-        if st.button("🗑️ Quitar firma de esta persona", key="firma_quitar"):
-            _guardar_firma_personal(storage, data, personal_id, "")
-    else:
-        st.info("Esta persona aún no tiene una firma registrada.")
+            st.image(firma_bytes, width=240)
+            st.caption("✅ Registrada: aparecerá automáticamente en las actas de esta persona.")
+        else:
+            st.info("Esta persona aún no tiene una firma registrada.")
+    with col_b:
+        if firma_actual:
+            if st.button("🗑️ Quitar firma de esta persona", key="firma_quitar"):
+                if _guardar_firma_personal(storage, data, personal_id, ""):
+                    st.session_state["firma_ok_msg"] = f"Firma eliminada para {sel_nombre}."
+                    st.session_state["firma_uploader_nonce"] = int(st.session_state.get("firma_uploader_nonce", 0)) + 1
+                    rerun()
+
+    st.markdown("---")
 
     # Método de captura: subir imagen siempre disponible; dibujar solo si la librería está instalada.
     try:
@@ -4300,19 +4326,25 @@ def staff_signature_manager(storage, data: Dict[str, pd.DataFrame]) -> None:
     metodos = ["Subir imagen"] + (["Dibujar firma"] if canvas_disponible else [])
     metodo = st.radio("¿Cómo desea registrar la firma?", metodos, horizontal=True, key="firma_metodo")
 
+    nonce = int(st.session_state.get("firma_uploader_nonce", 0))
+
     if metodo == "Subir imagen":
         st.caption("Recomendado: PNG con fondo transparente. También se aceptan JPG/JPEG. La imagen se ajusta automáticamente.")
-        archivo = st.file_uploader("Imagen de la firma", type=["png", "jpg", "jpeg"], key="firma_uploader")
+        # La clave incluye un nonce: al guardar se incrementa para LIMPIAR el uploader (la imagen desaparece).
+        archivo = st.file_uploader("Imagen de la firma", type=["png", "jpg", "jpeg"], key=f"firma_uploader_{nonce}")
         if archivo is not None:
             # getvalue() devuelve los bytes sin importar la posición del puntero (evita lecturas vacías al recargar).
             nueva_b64 = comprimir_firma_a_b64(archivo.getvalue())
             if not nueva_b64:
                 st.error("No se pudo procesar la imagen (puede ser muy grande). Use una firma más pequeña o en PNG.")
             else:
-                st.markdown("**Vista previa:**")
-                st.image(firma_b64_a_bytes(nueva_b64), width=260)
-                if st.button("💾 Guardar firma", key="firma_guardar_upload", type="primary"):
-                    _guardar_firma_personal(storage, data, personal_id, nueva_b64)
+                st.markdown("**Vista previa de la firma a guardar:**")
+                st.image(firma_b64_a_bytes(nueva_b64), width=240)
+                if st.button("💾 Guardar firma", key=f"firma_guardar_upload_{nonce}", type="primary"):
+                    if _guardar_firma_personal(storage, data, personal_id, nueva_b64):
+                        st.session_state["firma_ok_msg"] = f"✅ Firma guardada correctamente para {sel_nombre}."
+                        st.session_state["firma_uploader_nonce"] = nonce + 1  # limpia el uploader
+                        rerun()
 
     elif metodo == "Dibujar firma":
         from streamlit_drawable_canvas import st_canvas
@@ -4325,23 +4357,24 @@ def staff_signature_manager(storage, data: Dict[str, pd.DataFrame]) -> None:
             height=160,
             width=460,
             drawing_mode="freedraw",
-            key="firma_canvas",
+            key=f"firma_canvas_{nonce}",
         )
-        if st.button("💾 Guardar firma dibujada", key="firma_guardar_canvas", type="primary"):
+        if st.button("💾 Guardar firma dibujada", key=f"firma_guardar_canvas_{nonce}", type="primary"):
             if canvas is None or canvas.image_data is None:
                 st.error("Primero dibuje la firma en el recuadro.")
             else:
                 try:
                     from PIL import Image as PILImage
-                    import numpy as _np
                     arr = canvas.image_data.astype("uint8")
                     img = PILImage.fromarray(arr, mode="RGBA")
                     buf = BytesIO()
                     img.save(buf, format="PNG")
                     nueva_b64 = comprimir_firma_a_b64(buf.getvalue())
-                    if nueva_b64:
-                        _guardar_firma_personal(storage, data, personal_id, nueva_b64)
-                    else:
+                    if nueva_b64 and _guardar_firma_personal(storage, data, personal_id, nueva_b64):
+                        st.session_state["firma_ok_msg"] = f"✅ Firma guardada correctamente para {sel_nombre}."
+                        st.session_state["firma_uploader_nonce"] = nonce + 1
+                        rerun()
+                    elif not nueva_b64:
                         st.error("No se pudo procesar la firma dibujada.")
                 except Exception as exc:
                     st.error(f"No se pudo guardar la firma dibujada: {exc}")
