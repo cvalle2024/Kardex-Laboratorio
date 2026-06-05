@@ -4691,6 +4691,15 @@ def render_movement_crud_controls(storage, data: Dict[str, pd.DataFrame]) -> Non
 
     st.markdown("---")
 
+    # Etiqueta de versión para confirmar despliegue (si NO ve esta etiqueta en la
+    # nube, la app sigue corriendo la versión anterior y debe reiniciarse/redesplegar).
+    st.markdown(
+        "<div style='display:inline-block; background:rgba(34,197,94,.15); color:#22C55E; "
+        "border:1px solid rgba(34,197,94,.4); border-radius:8px; padding:3px 10px; font-size:12px; "
+        "font-weight:700; margin-bottom:10px;'>🆕 v29 · Edición ampliada (fecha de vencimiento habilitada)</div>",
+        unsafe_allow_html=True,
+    )
+
     # ── 2. SELECCIÓN DEL MOVIMIENTO ────────────────────────────────────────
     st.markdown("#### ✏️ Seleccione el movimiento a gestionar")
 
