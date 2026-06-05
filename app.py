@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import re
 import secrets
 import string
@@ -39,11 +40,14 @@ PATH_LENGTH = 8
 SESSION_TIMEOUT_MINUTES = 15
 
 KARDEX_CONSOLIDADO_COLUMNS: List[str] = [
-    "estado", "producto_id", "producto", "marca", "lote", "unidad",
+    # Orden visual solicitado para la tabla consolidada por lote:
+    # primero estado + movimientos/saldo, luego producto/marca y el resto de trazabilidad.
+    "estado", "entrada_total", "salida_total", "saldo_actual",
+    "producto", "marca", "lote", "unidad", "producto_id",
     "fecha_ingreso", "proveedor_ingreso", "orden_compra_ingreso", "fecha_elaboracion", "fecha_vencimiento",
-    "entrada_total", "salida_total", "saldo_actual", "porcentaje_consumido",
-    "numero_salidas", "fecha_ultima_salida", "ultimo_entregado_a", "ultimo_personal_entrega",
-    "detalle_salidas", "observacion_ingreso", "dias_para_vencer", "stock_minimo",
+    "porcentaje_consumido", "numero_salidas", "fecha_ultima_salida",
+    "ultimo_entregado_a", "ultimo_personal_entrega", "detalle_salidas",
+    "observacion_ingreso", "dias_para_vencer", "stock_minimo",
 ]
 
 SHEET_COLUMNS: Dict[str, List[str]] = {
@@ -422,6 +426,11 @@ def clean_str(value) -> str:
     if pd.isna(value):
         return ""
     return str(value).strip()
+
+
+def safe_html(value) -> str:
+    """Escapa textos de usuario antes de insertarlos en tarjetas HTML."""
+    return html.escape(clean_str(value), quote=True)
 
 
 def to_number(series, default: float = 0) -> pd.Series:
@@ -1320,6 +1329,7 @@ def stock_empty_frame() -> pd.DataFrame:
     return pd.DataFrame(columns=[
         "producto_id", "producto", "marca", "lote", "fecha_vencimiento", "unidad",
         "ingreso_total", "salida_total", "stock_actual", "costo_total_ingresos",
+        "fecha_ingreso", "proveedor_ingreso", "orden_compra_ingreso", "fecha_elaboracion",
         "stock_minimo", "dias_alerta_vencimiento", "dias_para_vencer", "estado"
     ])
 
@@ -1351,6 +1361,30 @@ def calcular_stock(df_mov: pd.DataFrame, df_prod: pd.DataFrame) -> pd.DataFrame:
         )
     )
     stock["stock_actual"] = stock["ingreso_total"] - stock["salida_total"]
+
+    # Trazabilidad del ingreso original del lote. Esto permite que la salida herede
+    # automáticamente la orden de compra y que el PDF del acta la imprima por producto.
+    positivos = df[df["mov_sign"] > 0].copy()
+    if not positivos.empty:
+        positivos = positivos.sort_values(["fecha", "fecha_registro"], na_position="last")
+        ingreso_info = (
+            positivos.groupby(group_cols, dropna=False)
+            .agg(
+                fecha_ingreso=("fecha", first_non_empty),
+                proveedor_ingreso=("proveedor", first_non_empty),
+                orden_compra_ingreso=("orden_compra", first_non_empty),
+                fecha_elaboracion=("fecha_elaboracion", first_non_empty),
+            )
+            .reset_index()
+        )
+        stock = stock.merge(ingreso_info, on=group_cols, how="left")
+    else:
+        for col in ["fecha_ingreso", "proveedor_ingreso", "orden_compra_ingreso", "fecha_elaboracion"]:
+            stock[col] = ""
+    for col in ["fecha_ingreso", "proveedor_ingreso", "orden_compra_ingreso", "fecha_elaboracion"]:
+        if col not in stock.columns:
+            stock[col] = ""
+        stock[col] = stock[col].fillna("")
 
     prod = ensure_columns(df_prod, "Productos")[["producto_id", "stock_minimo", "dias_alerta_vencimiento"]].copy()
     prod["stock_minimo"] = to_number(prod["stock_minimo"])
@@ -1425,6 +1459,10 @@ def calcular_stock_desde_kardex_consolidado(df_kardex: pd.DataFrame, df_prod: pd
         "salida_total": to_number(kd["salida_total"]),
         "stock_actual": to_number(kd["saldo_actual"]),
         "costo_total_ingresos": 0,
+        "fecha_ingreso": kd.get("fecha_ingreso", ""),
+        "proveedor_ingreso": kd.get("proveedor_ingreso", ""),
+        "orden_compra_ingreso": kd.get("orden_compra_ingreso", ""),
+        "fecha_elaboracion": kd.get("fecha_elaboracion", ""),
     })
     prod = ensure_columns(df_prod, "Productos")[["producto_id", "stock_minimo", "dias_alerta_vencimiento"]].copy()
     prod["stock_minimo"] = to_number(prod["stock_minimo"])
@@ -4016,12 +4054,12 @@ def page_kardex_consolidado(kardex: pd.DataFrame, storage=None, data: Dict[str, 
         df.insert(0, "🚦", df.apply(_row_class, axis=1))
 
     cols_view = [
-        "🚦", "estado", "producto", "marca", "lote", "unidad",
-        "fecha_ingreso", "proveedor_ingreso",
-        "fecha_vencimiento", "dias_para_vencer",
-        "entrada_total", "salida_total", "saldo_actual", "stock_minimo",
+        "🚦", "estado", "entrada_total", "salida_total", "saldo_actual",
+        "producto", "marca", "lote", "unidad",
+        "fecha_ingreso", "proveedor_ingreso", "orden_compra_ingreso", "fecha_elaboracion",
+        "fecha_vencimiento", "dias_para_vencer", "porcentaje_consumido", "stock_minimo",
         "numero_salidas", "fecha_ultima_salida", "ultimo_entregado_a",
-        "detalle_salidas",
+        "ultimo_personal_entrega", "detalle_salidas", "observacion_ingreso", "producto_id",
     ]
     available_cols = [c for c in cols_view if c in df.columns]
     st.dataframe(
@@ -4035,6 +4073,8 @@ def page_kardex_consolidado(kardex: pd.DataFrame, storage=None, data: Dict[str, 
             "saldo_actual":   st.column_config.NumberColumn("📦 Saldo",    format="%.0f"),
             "stock_minimo":   st.column_config.NumberColumn("Mín.",        format="%.0f"),
             "dias_para_vencer": st.column_config.NumberColumn("Días vence", format="%d"),
+            "porcentaje_consumido": st.column_config.ProgressColumn("% consumido", min_value=0, max_value=1),
+            "orden_compra_ingreso": st.column_config.TextColumn("Orden compra", width="medium"),
             "numero_salidas": st.column_config.NumberColumn("# Salidas",   format="%d"),
             "detalle_salidas": st.column_config.TextColumn("Detalle salidas", width="large"),
         },
@@ -4134,6 +4174,7 @@ def save_new_product(storage, data, values: dict) -> None:
 
 def product_form(storage, data: Dict[str, pd.DataFrame]) -> None:
     card_start("Nuevo producto", "Registre productos con stock mínimo y días de alerta por vencimiento.")
+    confirm_key = "crear_producto_catalogo"
     with st.form("frm_producto", clear_on_submit=True):
         c1, c2 = st.columns([1, 2])
         codigo = c1.text_input("Código interno", placeholder="Ejemplo: HIV-RAP-001")
@@ -4152,7 +4193,7 @@ def product_form(storage, data: Dict[str, pd.DataFrame]) -> None:
         if not nombre:
             st.error("El nombre del producto es obligatorio.")
             return
-        save_new_product(storage, data, {
+        set_confirm_pending(confirm_key, {
             "codigo_producto": codigo or nombre[:18].upper().replace(" ", "-"),
             "nombre_producto": nombre,
             "categoria": categoria,
@@ -4162,16 +4203,39 @@ def product_form(storage, data: Dict[str, pd.DataFrame]) -> None:
             "dias_alerta_vencimiento": dias_alerta,
             "activo": activo,
             "observacion": observacion,
-            "estado_registro": "Activo",
+            "estado_registro": "Activo" if activo == "Sí" else "Inactivo",
             "creado_por": current_username(),
             "fecha_creacion": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
         })
+        st.rerun()
+
+    if confirm_pending(confirm_key):
+        payload = get_confirm_payload(confirm_key)
+        confirmed = render_confirm_box(
+            key=confirm_key,
+            title="¿Desea ingresar este producto?",
+            body=(
+                f"<b>Producto:</b> {safe_html(payload.get('nombre_producto',''))}<br>"
+                f"<b>Código:</b> {safe_html(payload.get('codigo_producto',''))}<br>"
+                f"<b>Categoría:</b> {safe_html(payload.get('categoria',''))}<br>"
+                f"<b>Marca:</b> {safe_html(payload.get('marca_default','')) or '—'}<br>"
+                f"<b>Unidad:</b> {safe_html(payload.get('unidad_default',''))}<br>"
+                f"<b>Stock mínimo:</b> {float(payload.get('stock_minimo', 0) or 0):g}"
+            ),
+            confirm_label="✅ Sí, ingresar producto",
+            cancel_label="↩ Cancelar",
+            danger=False,
+        )
+        if not confirmed:
+            return
+        save_new_product(storage, data, payload)
         set_flash("Producto guardado correctamente. El formulario quedó limpio para registrar un nuevo producto.")
         rerun()
 
 
 def provider_form(storage, data: Dict[str, pd.DataFrame]) -> None:
     card_start("Nuevo proveedor", "Formulario ordenado por datos generales, contacto y ubicación.")
+    confirm_key = "crear_proveedor_catalogo"
     with st.form("frm_proveedor", clear_on_submit=True):
         st.markdown("##### Datos generales")
         c1, c2 = st.columns([2, 1])
@@ -4192,9 +4256,7 @@ def provider_form(storage, data: Dict[str, pd.DataFrame]) -> None:
         if not proveedor:
             st.error("El nombre del proveedor es obligatorio.")
             return
-        df = ensure_columns(data["Proveedores"], "Proveedores")
-        row = {
-            "proveedor_id": next_code("PROV", df, "proveedor_id", 4),
+        set_confirm_pending(confirm_key, {
             "proveedor": proveedor,
             "descripcion": descripcion,
             "ruc": ruc,
@@ -4206,7 +4268,29 @@ def provider_form(storage, data: Dict[str, pd.DataFrame]) -> None:
             "estado_registro": "Activo" if activo == "Sí" else "Inactivo",
             "creado_por": current_username(),
             "fecha_creacion": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
+        })
+        st.rerun()
+
+    if confirm_pending(confirm_key):
+        payload = get_confirm_payload(confirm_key)
+        confirmed = render_confirm_box(
+            key=confirm_key,
+            title="¿Desea ingresar este proveedor?",
+            body=(
+                f"<b>Proveedor:</b> {safe_html(payload.get('proveedor',''))}<br>"
+                f"<b>RTN/RUC:</b> {safe_html(payload.get('ruc','')) or '—'}<br>"
+                f"<b>Representante:</b> {safe_html(payload.get('representante','')) or '—'}<br>"
+                f"<b>Teléfono:</b> {safe_html(payload.get('telefono','')) or '—'}<br>"
+                f"<b>Estado:</b> {safe_html(payload.get('estado_registro',''))}"
+            ),
+            confirm_label="✅ Sí, ingresar proveedor",
+            cancel_label="↩ Cancelar",
+            danger=False,
+        )
+        if not confirmed:
+            return
+        df = ensure_columns(data["Proveedores"], "Proveedores")
+        row = {"proveedor_id": next_code("PROV", df, "proveedor_id", 4), **payload}
         storage.append_row("Proveedores", row)
         set_flash("Proveedor guardado correctamente. El formulario quedó limpio para registrar un nuevo proveedor.")
         rerun()
@@ -4214,6 +4298,7 @@ def provider_form(storage, data: Dict[str, pd.DataFrame]) -> None:
 
 def requester_form(storage, data: Dict[str, pd.DataFrame]) -> None:
     card_start("Nuevo solicitante / unidad", "Registre unidades, áreas o sitios que pueden solicitar productos.")
+    confirm_key = "crear_solicitante_catalogo"
     with st.form("frm_solicitante", clear_on_submit=True):
         c1, c2, c3 = st.columns([2, 1, 1])
         unidad = c1.text_input("Unidad solicitante *", placeholder="Ejemplo: Hospital, laboratorio, componente, sitio")
@@ -4229,9 +4314,7 @@ def requester_form(storage, data: Dict[str, pd.DataFrame]) -> None:
         if not unidad:
             st.error("La unidad solicitante es obligatoria.")
             return
-        df = ensure_columns(data["Solicitantes"], "Solicitantes")
-        row = {
-            "solicitante_id": next_code("SOL", df, "solicitante_id", 4),
+        set_confirm_pending(confirm_key, {
             "unidad_solicitante": unidad,
             "departamento": departamento,
             "municipio": municipio,
@@ -4242,7 +4325,29 @@ def requester_form(storage, data: Dict[str, pd.DataFrame]) -> None:
             "estado_registro": "Activo" if activo == "Sí" else "Inactivo",
             "creado_por": current_username(),
             "fecha_creacion": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
+        })
+        st.rerun()
+
+    if confirm_pending(confirm_key):
+        payload = get_confirm_payload(confirm_key)
+        confirmed = render_confirm_box(
+            key=confirm_key,
+            title="¿Desea ingresar este solicitante / unidad?",
+            body=(
+                f"<b>Unidad:</b> {safe_html(payload.get('unidad_solicitante',''))}<br>"
+                f"<b>Departamento:</b> {safe_html(payload.get('departamento','')) or '—'}<br>"
+                f"<b>Municipio:</b> {safe_html(payload.get('municipio','')) or '—'}<br>"
+                f"<b>Responsable:</b> {safe_html(payload.get('responsable','')) or '—'}<br>"
+                f"<b>Estado:</b> {safe_html(payload.get('estado_registro',''))}"
+            ),
+            confirm_label="✅ Sí, ingresar solicitante",
+            cancel_label="↩ Cancelar",
+            danger=False,
+        )
+        if not confirmed:
+            return
+        df = ensure_columns(data["Solicitantes"], "Solicitantes")
+        row = {"solicitante_id": next_code("SOL", df, "solicitante_id", 4), **payload}
         storage.append_row("Solicitantes", row)
         set_flash("Solicitante guardado correctamente. El formulario quedó limpio para registrar una nueva unidad solicitante.")
         rerun()
@@ -4250,6 +4355,7 @@ def requester_form(storage, data: Dict[str, pd.DataFrame]) -> None:
 
 def staff_form(storage, data: Dict[str, pd.DataFrame]) -> None:
     card_start("Nuevo personal", "Usuarios operativos que reciben, entregan o registran movimientos.")
+    confirm_key = "crear_personal_catalogo"
     with st.form("frm_personal", clear_on_submit=True):
         c1, c2, c3, c4 = st.columns([2, 1, 1.4, .8])
         nombre = c1.text_input("Nombre completo *")
@@ -4261,9 +4367,7 @@ def staff_form(storage, data: Dict[str, pd.DataFrame]) -> None:
         if not nombre:
             st.error("El nombre es obligatorio.")
             return
-        df = ensure_columns(data["Personal"], "Personal")
-        row = {
-            "personal_id": next_code("PER", df, "personal_id", 4),
+        set_confirm_pending(confirm_key, {
             "nombre": nombre,
             "cargo": cargo,
             "correo": correo,
@@ -4271,11 +4375,31 @@ def staff_form(storage, data: Dict[str, pd.DataFrame]) -> None:
             "estado_registro": "Activo" if activo == "Sí" else "Inactivo",
             "creado_por": current_username(),
             "fecha_creacion": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
+        })
+        st.rerun()
+
+    if confirm_pending(confirm_key):
+        payload = get_confirm_payload(confirm_key)
+        confirmed = render_confirm_box(
+            key=confirm_key,
+            title="¿Desea ingresar este personal?",
+            body=(
+                f"<b>Nombre:</b> {safe_html(payload.get('nombre',''))}<br>"
+                f"<b>Cargo:</b> {safe_html(payload.get('cargo','')) or '—'}<br>"
+                f"<b>Correo:</b> {safe_html(payload.get('correo','')) or '—'}<br>"
+                f"<b>Estado:</b> {safe_html(payload.get('estado_registro',''))}"
+            ),
+            confirm_label="✅ Sí, ingresar personal",
+            cancel_label="↩ Cancelar",
+            danger=False,
+        )
+        if not confirmed:
+            return
+        df = ensure_columns(data["Personal"], "Personal")
+        row = {"personal_id": next_code("PER", df, "personal_id", 4), **payload}
         storage.append_row("Personal", row)
         set_flash("Personal guardado correctamente. El formulario quedó limpio para registrar un nuevo personal.")
         rerun()
-
 
 def get_firma_personal(data: Dict[str, pd.DataFrame], personal_id: str) -> str:
     """Devuelve la firma base64 de una persona almacenada en Config (o "")."""
