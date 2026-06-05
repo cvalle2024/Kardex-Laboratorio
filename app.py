@@ -2788,6 +2788,7 @@ def build_acta_entrega_pdf(
         Paragraph("<b>PRESENTACIÓN / CANTIDAD</b>", normal_center),
         Paragraph("<b>FECHA DE<br/>VENCIMIENTO</b>", normal_center),
         Paragraph("<b>LOTE</b>", normal_center),
+        Paragraph("<b>ORDEN DE<br/>COMPRA</b>", normal_center),
     ]]
     for r in salida_rows:
         desc = clean_str(r.get("producto", ""))
@@ -2797,14 +2798,16 @@ def build_acta_entrega_pdf(
         cantidad = float(r.get("cantidad", 0) or 0)
         cantidad_txt = f"{cantidad:,.0f}" if cantidad.is_integer() else f"{cantidad:,.2f}"
         unidad = clean_str(r.get("unidad", ""))
+        orden_compra_txt = clean_str(r.get("orden_compra", "")) or "—"
         data_table.append([
             Paragraph(desc, normal_center),
             Paragraph(f"{cantidad_txt} {unidad}", normal_center),
             Paragraph(format_date(r.get("fecha_vencimiento", "")), normal_center),
             Paragraph(clean_str(r.get("lote", "")), normal_center),
+            Paragraph(orden_compra_txt, normal_center),
         ])
 
-    table = Table(data_table, colWidths=[2.30 * inch, 1.85 * inch, 1.55 * inch, 1.15 * inch], hAlign="CENTER")
+    table = Table(data_table, colWidths=[2.05 * inch, 1.45 * inch, 1.20 * inch, 1.00 * inch, 1.10 * inch], hAlign="CENTER")
     table.setStyle(TableStyle([
         ("GRID", (0, 0), (-1, -1), 1.1, colors.black),
         ("BOX", (0, 0), (-1, -1), 1.6, colors.black),
@@ -3421,6 +3424,8 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
                         "fecha_vencimiento": format_date(selected_stock_row["fecha_vencimiento"]),
                         "unidad": clean_str(selected_stock_row["unidad"]),
                         "categoria": clean_str(prod_info_item.get("categoria", "")),
+                        # Orden de compra heredada del ingreso del lote (para imprimirla en el acta).
+                        "orden_compra": clean_str(selected_stock_row.get("orden_compra_ingreso", "")),
                         "cantidad": cantidad_item,
                         "stock_disponible": disponible,
                     })
@@ -3625,7 +3630,7 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
                     "marca": item["marca"],
                     "lote": item["lote"],
                     "proveedor": "",
-                    "orden_compra": "",
+                    "orden_compra": clean_str(item.get("orden_compra", "")),
                     "solicitante": solicitante,
                     "personal": personal,
                     "fecha_elaboracion": "",
@@ -4787,11 +4792,11 @@ def render_movement_crud_controls(storage, data: Dict[str, pd.DataFrame]) -> Non
         else:
             # Advertencia contextual por tipo
             tips = {
-                "Ingreso":            "💡 Para un ingreso puede corregir la cantidad, lote, marca, proveedor y fecha. El producto no cambia para preservar el Kardex.",
-                "Salida":             "💡 Para una salida puede corregir la cantidad, el sitio receptor, el personal y la fecha. El lote no cambia porque identifica el stock afectado.",
-                "Devolución":         "💡 Para una devolución puede corregir la cantidad, quién devolvió, el personal receptor y la fecha.",
-                "Corrección entrada": "💡 Para correcciones solo se puede ajustar la cantidad, la fecha y la observación.",
-                "Corrección salida":  "💡 Para correcciones solo se puede ajustar la cantidad, la fecha y la observación.",
+                "Ingreso":            "💡 Para un ingreso puede corregir la cantidad, lote, marca, unidad, proveedor, orden de compra, fecha del movimiento y las fechas de elaboración y vencimiento. El producto no cambia para preservar el Kardex.",
+                "Salida":             "💡 Para una salida puede corregir la cantidad, el sitio receptor, el personal y la fecha. En 'Corregir datos del lote' puede ajustar lote, marca, orden de compra y fecha de vencimiento si hubo un error.",
+                "Devolución":         "💡 Para una devolución puede corregir la cantidad, quién devolvió, el personal receptor y la fecha. En 'Corregir datos del lote' puede ajustar lote, marca y fecha de vencimiento.",
+                "Corrección entrada": "💡 Para correcciones puede ajustar la cantidad, la fecha, la observación y la fecha de vencimiento del lote.",
+                "Corrección salida":  "💡 Para correcciones puede ajustar la cantidad, la fecha, la observación y la fecha de vencimiento del lote.",
             }
             st.markdown(
                 f"<div class='alert-orange' style='margin-bottom:14px;'>{tips.get(tipo_mov, '💡 Edite solo los campos necesarios.')} "
@@ -4811,6 +4816,8 @@ def render_movement_crud_controls(storage, data: Dict[str, pd.DataFrame]) -> Non
             val_pers    = clean_str(selected.get("personal", ""))
             val_obs     = clean_str(selected.get("observacion", ""))
             val_costo   = float(pd.to_numeric(selected.get("costo_total", 0), errors="coerce") or 0)
+            val_venc    = clean_str(selected.get("fecha_vencimiento", ""))
+            val_elab    = clean_str(selected.get("fecha_elaboracion", ""))
 
             # Listas para selectbox
             lista_proveedores  = [""] + proveedores[active_mask(proveedores)]["proveedor"].dropna().astype(str).sort_values().tolist()
@@ -4848,6 +4855,17 @@ def render_movement_crud_controls(storage, data: Dict[str, pd.DataFrame]) -> Non
                     nueva_marca = c2.text_input("Marca", value=val_marca)
                     nueva_unidad = c3.selectbox("Unidad", lista_unidades, index=unidad_idx)
 
+                    st.markdown("##### 📅 Fechas del lote")
+                    f1, f2 = st.columns(2)
+                    nueva_elab = f1.text_input(
+                        "Fecha de elaboración", value=val_elab,
+                        help="Formato YYYY-MM-DD. Déjelo vacío si no aplica.",
+                    )
+                    nueva_venc = f2.text_input(
+                        "Fecha de vencimiento", value=val_venc,
+                        help="Formato YYYY-MM-DD. Al cambiarla se recalcula el stock del lote.",
+                    )
+
                     st.markdown("##### 🏭 Proveedor y logística")
                     d1, d2 = st.columns(2)
                     nuevo_prov = d1.selectbox("Proveedor", lista_proveedores, index=prov_idx)
@@ -4859,6 +4877,7 @@ def render_movement_crud_controls(storage, data: Dict[str, pd.DataFrame]) -> Non
                     new_values = {
                         "cantidad": nueva_cantidad, "fecha": nueva_fecha,
                         "lote": nuevo_lote, "marca": nueva_marca, "unidad": nueva_unidad,
+                        "fecha_elaboracion": nueva_elab, "fecha_vencimiento": nueva_venc,
                         "proveedor": nuevo_prov, "orden_compra": nuevo_oc,
                         "personal": nuevo_pers, "observacion": nueva_obs, "costo_total": nuevo_costo,
                     }
@@ -4871,10 +4890,24 @@ def render_movement_crud_controls(storage, data: Dict[str, pd.DataFrame]) -> Non
                     nuevo_pers  = d2.selectbox("Personal que entregó", lista_personal, index=pers_idx,
                                                help="Persona del equipo que realizó la entrega.")
                     nueva_obs = st.text_area("Observación", value=val_obs)
+                    with st.expander("✏️ Corregir datos del lote (lote, marca, orden de compra y fechas)"):
+                        st.caption(
+                            "Use esta sección solo para corregir un error de digitación. El lote, la marca y la "
+                            "fecha de vencimiento deben coincidir con el lote del que salió el producto para que el "
+                            "stock se calcule correctamente."
+                        )
+                        e1, e2 = st.columns(2)
+                        nuevo_lote  = e1.text_input("Lote", value=val_lote)
+                        nueva_marca = e2.text_input("Marca", value=val_marca)
+                        e3, e4 = st.columns(2)
+                        nueva_venc = e3.text_input("Fecha de vencimiento", value=val_venc, help="Formato YYYY-MM-DD.")
+                        nuevo_oc   = e4.text_input("Orden de compra", value=val_oc, help="Aparece en el acta de entrega.")
                     new_values = {
                         "cantidad": nueva_cantidad, "fecha": nueva_fecha,
                         "solicitante": nuevo_solic, "personal": nuevo_pers,
                         "observacion": nueva_obs,
+                        "lote": nuevo_lote, "marca": nueva_marca,
+                        "fecha_vencimiento": nueva_venc, "orden_compra": nuevo_oc,
                     }
 
                 elif tipo_mov == "Devolución":
@@ -4884,10 +4917,21 @@ def render_movement_crud_controls(storage, data: Dict[str, pd.DataFrame]) -> Non
                                                help="Sitio o unidad que realizó la devolución.")
                     nuevo_pers  = d2.selectbox("Personal que recibió la devolución", lista_personal, index=pers_idx)
                     nueva_obs = st.text_area("Observación", value=val_obs)
+                    with st.expander("✏️ Corregir datos del lote (lote, marca y fecha de vencimiento)"):
+                        st.caption(
+                            "El lote, la marca y la fecha de vencimiento deben coincidir con el lote devuelto "
+                            "para que el stock se calcule correctamente."
+                        )
+                        e1, e2 = st.columns(2)
+                        nuevo_lote  = e1.text_input("Lote", value=val_lote)
+                        nueva_marca = e2.text_input("Marca", value=val_marca)
+                        nueva_venc = st.text_input("Fecha de vencimiento", value=val_venc, help="Formato YYYY-MM-DD.")
                     new_values = {
                         "cantidad": nueva_cantidad, "fecha": nueva_fecha,
                         "solicitante": nuevo_solic, "personal": nuevo_pers,
                         "observacion": nueva_obs,
+                        "lote": nuevo_lote, "marca": nueva_marca,
+                        "fecha_vencimiento": nueva_venc,
                     }
 
                 elif tipo_mov in ("Corrección entrada", "Corrección salida"):
@@ -4896,9 +4940,13 @@ def render_movement_crud_controls(storage, data: Dict[str, pd.DataFrame]) -> Non
                         "Justificación de la corrección *", value=val_obs,
                         placeholder="Explique por qué se corrige esta cantidad.",
                     )
+                    with st.expander("✏️ Corregir fecha de vencimiento del lote"):
+                        st.caption("La fecha de vencimiento debe coincidir con el lote afectado.")
+                        nueva_venc = st.text_input("Fecha de vencimiento", value=val_venc, help="Formato YYYY-MM-DD.")
                     new_values = {
                         "cantidad": nueva_cantidad, "fecha": nueva_fecha,
                         "observacion": nueva_obs,
+                        "fecha_vencimiento": nueva_venc,
                     }
 
                 else:
@@ -4993,7 +5041,7 @@ def render_movement_crud_controls(storage, data: Dict[str, pd.DataFrame]) -> Non
                 new_df.loc[mask, "motivo_modificacion"] = motivo
                 storage.save("Movimientos", ensure_columns(new_df, "Movimientos"))
                 append_audit_rows(storage, audit_rows)
-                if cantidad_cambio or any(k in new_values for k in ("lote", "marca", "unidad")):
+                if cantidad_cambio or any(k in new_values for k in ("lote", "marca", "unidad", "fecha_vencimiento", "fecha_elaboracion")):
                     sync_data = dict(data)
                     sync_data["Movimientos"] = ensure_columns(new_df, "Movimientos")
                     try:
