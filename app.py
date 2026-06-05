@@ -1325,6 +1325,72 @@ def movimiento_sign(value) -> int:
     return 0
 
 
+def normalize_lote_key(value) -> str:
+    """Normaliza un lote para comparar y evitar duplicados por espacios/mayúsculas."""
+    text = normalize_movement_text(value)
+    text = re.sub(r"[\s\-_/]+", "", text)
+    return text
+
+
+def producto_activo_en_catalogo(df_prod: pd.DataFrame, producto_id: str) -> bool:
+    """Valida que el producto seleccionado siga existiendo y activo en catálogo."""
+    prod = ensure_columns(df_prod, "Productos")
+    if prod.empty:
+        return False
+    prod = prod[active_mask(prod)].copy()
+    return not prod[prod["producto_id"].astype(str).str.strip().eq(clean_str(producto_id))].empty
+
+
+def producto_lote_ya_registrado(df_mov: pd.DataFrame, producto_id: str, lote: str) -> Tuple[bool, dict]:
+    """Detecta si un producto/lote ya existe en Movimientos vigentes.
+
+    Esta validación bloquea un segundo movimiento de tipo Ingreso para el mismo
+    producto/lote. Si se necesita sumar cantidad a ese lote, debe usarse
+    Corrección entrada / Ajuste (+), dejando trazabilidad sin duplicar el ingreso
+    original.
+    """
+    mov = ensure_columns(df_mov, "Movimientos")
+    info = {
+        "entrada_total": 0.0,
+        "salida_total": 0.0,
+        "saldo_actual": 0.0,
+        "fecha_ingreso": "",
+        "proveedor": "",
+        "orden_compra": "",
+        "movimiento_id": "",
+    }
+    if mov.empty or not clean_str(producto_id) or not clean_str(lote):
+        return False, info
+
+    mov = mov[valid_movement_mask(mov)].copy()
+    if mov.empty:
+        return False, info
+
+    mov["_producto_id_norm"] = mov["producto_id"].astype(str).str.strip()
+    mov["_lote_norm"] = mov["lote"].apply(normalize_lote_key)
+    lote_key = normalize_lote_key(lote)
+    match = mov[(mov["_producto_id_norm"] == clean_str(producto_id)) & (mov["_lote_norm"] == lote_key)].copy()
+    if match.empty:
+        return False, info
+
+    match["cantidad_num"] = to_number(match["cantidad"])
+    match["mov_sign"] = match["tipo_movimiento"].apply(movimiento_sign)
+    info["entrada_total"] = float(match.loc[match["mov_sign"] > 0, "cantidad_num"].sum())
+    info["salida_total"] = float(match.loc[match["mov_sign"] < 0, "cantidad_num"].sum())
+    info["saldo_actual"] = info["entrada_total"] - info["salida_total"]
+
+    ingresos = match[match["mov_sign"] > 0].copy()
+    if not ingresos.empty:
+        ingresos = ingresos.sort_values(["fecha", "fecha_registro"], na_position="last")
+        first = ingresos.iloc[0]
+        info["fecha_ingreso"] = format_date(first.get("fecha", ""))
+        info["proveedor"] = clean_str(first.get("proveedor", ""))
+        info["orden_compra"] = clean_str(first.get("orden_compra", ""))
+        info["movimiento_id"] = clean_str(first.get("movimiento_id", ""))
+
+    return True, info
+
+
 def stock_empty_frame() -> pd.DataFrame:
     return pd.DataFrame(columns=[
         "producto_id", "producto", "marca", "lote", "fecha_vencimiento", "unidad",
@@ -3229,6 +3295,7 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
     # INGRESO
     # ========================================================
     if tipo == "Ingreso":
+        confirm_key_ingreso = "guardar_ingreso_inventario"
         st.markdown("<div class='form-card'>", unsafe_allow_html=True)
         st.markdown(
             "<div class='step-title'><span class='step-badge'>1</span>Producto del catálogo</div>",
@@ -3299,12 +3366,47 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             if not proveedor:
                 st.error("⚠️ Para ingresos debe seleccionar proveedor.")
                 return
-            set_confirm_pending(f"guardar_ingreso_{lote}_{producto_id}", {
-                "producto": producto, "lote": lote, "cantidad": cantidad,
-                "proveedor": proveedor, "unidad": unidad,
+            if not producto_activo_en_catalogo(data.get("Productos", pd.DataFrame()), producto_id):
+                st.error(
+                    "⛔ El producto seleccionado ya no está activo en el catálogo. "
+                    "Reactive o cree el producto desde Catálogos antes de registrar el ingreso."
+                )
+                return
+            existe_lote, info_lote = producto_lote_ya_registrado(movimientos, producto_id, lote)
+            if existe_lote:
+                st.error(
+                    "⛔ Este producto/lote ya fue registrado en el Kardex. "
+                    "Para sumar más unidades al mismo lote use la opción "
+                    "'🔧 Ajuste (+) — Agregar unidades por conteo físico', no registre otro ingreso."
+                )
+                st.info(
+                    f"Resumen del lote existente: entrada {info_lote.get('entrada_total', 0):g}, "
+                    f"salida {info_lote.get('salida_total', 0):g}, "
+                    f"saldo {info_lote.get('saldo_actual', 0):g}. "
+                    f"Fecha ingreso: {info_lote.get('fecha_ingreso') or '—'} | "
+                    f"Proveedor: {info_lote.get('proveedor') or '—'} | "
+                    f"OC: {info_lote.get('orden_compra') or '—'}."
+                )
+                return
+            set_confirm_pending(confirm_key_ingreso, {
+                "fecha": pd.to_datetime(fecha).strftime("%Y-%m-%d"),
+                "usuario": usuario,
+                "producto_id": producto_id,
+                "producto": producto,
+                "marca": marca,
+                "lote": lote,
+                "proveedor": proveedor,
+                "orden_compra": orden_compra,
+                "personal": personal,
+                "fecha_elaboracion": fecha_elaboracion_dt.strftime("%Y-%m-%d"),
+                "fecha_vencimiento": fecha_vencimiento_dt.strftime("%Y-%m-%d"),
+                "unidad": unidad,
+                "cantidad": cantidad,
+                "costo_total": costo_total,
+                "observacion": observacion,
             })
 
-        confirm_key_ing = f"guardar_ingreso_{lote}_{producto_id}" if submitted or confirm_pending(f"guardar_ingreso_{lote}_{producto_id}") else ""
+        confirm_key_ing = confirm_key_ingreso if confirm_pending(confirm_key_ingreso) else ""
         if confirm_key_ing and confirm_pending(confirm_key_ing):
             _pay = get_confirm_payload(confirm_key_ing)
             confirmed_ing = render_confirm_box(
@@ -3322,25 +3424,45 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             )
             if not confirmed_ing:
                 return
+            pay_producto_id = clean_str(_pay.get("producto_id", ""))
+            pay_lote = clean_str(_pay.get("lote", ""))
+            if not producto_activo_en_catalogo(data.get("Productos", pd.DataFrame()), pay_producto_id):
+                st.error(
+                    "⛔ No se guardó el ingreso porque el producto ya no está activo en catálogo. "
+                    "Reactive o cree el producto desde Catálogos antes de registrar el ingreso."
+                )
+                return
+            existe_lote, info_lote = producto_lote_ya_registrado(movimientos, pay_producto_id, pay_lote)
+            if existe_lote:
+                st.error(
+                    "⛔ No se guardó el ingreso porque este producto/lote ya existe. "
+                    "Use Corrección entrada / Ajuste (+) para sumar cantidad al mismo lote."
+                )
+                st.info(
+                    f"Resumen del lote existente: entrada {info_lote.get('entrada_total', 0):g}, "
+                    f"salida {info_lote.get('salida_total', 0):g}, "
+                    f"saldo {info_lote.get('saldo_actual', 0):g}."
+                )
+                return
             row = {
                 "movimiento_id": next_code("MOV", movimientos, "movimiento_id", 6),
-                "fecha": pd.to_datetime(fecha).strftime("%Y-%m-%d"),
+                "fecha": clean_str(_pay.get("fecha", "")) or TODAY.strftime("%Y-%m-%d"),
                 "tipo_movimiento": "Ingreso",
-                "producto_id": producto_id,
-                "producto": producto,
-                "marca": marca,
-                "lote": lote,
-                "proveedor": proveedor,
-                "orden_compra": orden_compra,
+                "producto_id": pay_producto_id,
+                "producto": clean_str(_pay.get("producto", "")),
+                "marca": clean_str(_pay.get("marca", "")),
+                "lote": pay_lote,
+                "proveedor": clean_str(_pay.get("proveedor", "")),
+                "orden_compra": clean_str(_pay.get("orden_compra", "")),
                 "solicitante": "",
-                "personal": personal,
-                "fecha_elaboracion": fecha_elaboracion_dt.strftime("%Y-%m-%d"),
-                "fecha_vencimiento": fecha_vencimiento_dt.strftime("%Y-%m-%d"),
-                "unidad": unidad,
-                "cantidad": cantidad,
-                "costo_total": costo_total,
-                "observacion": observacion,
-                "usuario_registro": usuario,
+                "personal": clean_str(_pay.get("personal", "")),
+                "fecha_elaboracion": clean_str(_pay.get("fecha_elaboracion", "")),
+                "fecha_vencimiento": clean_str(_pay.get("fecha_vencimiento", "")),
+                "unidad": clean_str(_pay.get("unidad", "")),
+                "cantidad": float(_pay.get("cantidad", 0) or 0),
+                "costo_total": float(_pay.get("costo_total", 0) or 0),
+                "observacion": clean_str(_pay.get("observacion", "")),
+                "usuario_registro": clean_str(_pay.get("usuario", "")) or current_username(),
                 "fecha_registro": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "acta_entrega_id": "",
             }
