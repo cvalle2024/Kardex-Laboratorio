@@ -5059,6 +5059,9 @@ def render_movement_crud_controls(storage, data: Dict[str, pd.DataFrame]) -> Non
                         pass
                 campos_editados = ", ".join(r["campo"] for r in audit_rows)
                 set_flash(f"✅ Movimiento {mov_id} actualizado. Campos modificados: {campos_editados}.")
+                # Limpia la caché de datos para que el Kardex consolidado se recalcule
+                # con la base ya actualizada (estado/días para vencer/saldos).
+                mark_data_dirty()
                 rerun()
 
     # ─────────────────────────────────────────────────────────────────────
