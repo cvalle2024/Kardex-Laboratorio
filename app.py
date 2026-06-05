@@ -429,16 +429,38 @@ def to_number(series, default: float = 0) -> pd.Series:
 
 
 def to_date(series) -> pd.Series:
-    return pd.to_datetime(series, errors="coerce", dayfirst=True, format="mixed")
+    # IMPORTANTE: NO usar dayfirst=True. En pandas reciente eso invierte las fechas
+    # ISO (AAAA-MM-DD) cuando día y mes son ambos <=12 (ej. 2026-10-05 se leía como
+    # 10 de mayo), provocando estados "Vencido" incorrectos. El formato canónico de la
+    # app es ISO (los date_input lo generan), y format="mixed" lo interpreta bien.
+    return pd.to_datetime(series, errors="coerce", format="mixed")
 
 
 def format_date(value) -> str:
     if pd.isna(value) or value == "":
         return ""
+    # Usa la misma interpretación que to_date (sin dayfirst) para que lo que se
+    # MUESTRA coincida siempre con lo que se CALCULA (días para vencer/estado).
+    dt = pd.to_datetime(value, errors="coerce", format="mixed")
+    if pd.isna(dt):
+        return clean_str(value)
+    return dt.strftime("%Y-%m-%d")
+
+
+def fecha_a_date(value):
+    """Convierte texto/Timestamp a datetime.date (o None) para usar en st.date_input."""
+    dt = pd.to_datetime(value, errors="coerce", format="mixed")
+    return dt.date() if pd.notna(dt) else None
+
+
+def date_a_iso(value) -> str:
+    """Convierte un valor de fecha (date/Timestamp/texto) a string ISO YYYY-MM-DD."""
+    if value in (None, ""):
+        return ""
     try:
         return pd.to_datetime(value).strftime("%Y-%m-%d")
     except Exception:
-        return clean_str(value)
+        return ""
 
 
 def active_mask(df: pd.DataFrame, col: str = "activo") -> pd.Series:
@@ -4851,8 +4873,10 @@ def render_movement_crud_controls(storage, data: Dict[str, pd.DataFrame]) -> Non
                     format="%.2f",
                     help="Corrija la cantidad si fue ingresada incorrectamente.",
                 )
-                nueva_fecha = col_fecha.text_input("Fecha del movimiento", value=val_fecha,
-                                                    help="Formato YYYY-MM-DD")
+                nueva_fecha = date_a_iso(col_fecha.date_input(
+                    "Fecha del movimiento", value=fecha_a_date(val_fecha),
+                    help="Seleccione la fecha en el calendario.",
+                ))
 
                 # ── CAMPOS SEGÚN TIPO ─────────────────────────────────────
                 new_values: dict = {}
@@ -4866,14 +4890,14 @@ def render_movement_crud_controls(storage, data: Dict[str, pd.DataFrame]) -> Non
 
                     st.markdown("##### 📅 Fechas del lote")
                     f1, f2 = st.columns(2)
-                    nueva_elab = f1.text_input(
-                        "Fecha de elaboración", value=val_elab,
-                        help="Formato YYYY-MM-DD. Déjelo vacío si no aplica.",
-                    )
-                    nueva_venc = f2.text_input(
-                        "Fecha de vencimiento", value=val_venc,
-                        help="Formato YYYY-MM-DD. Al cambiarla se recalcula el stock del lote.",
-                    )
+                    nueva_elab = date_a_iso(f1.date_input(
+                        "Fecha de elaboración", value=fecha_a_date(val_elab),
+                        help="Seleccione la fecha. Déjela vacía si no aplica.",
+                    ))
+                    nueva_venc = date_a_iso(f2.date_input(
+                        "Fecha de vencimiento", value=fecha_a_date(val_venc),
+                        help="Al cambiarla se recalcula el estado y los días para vencer del lote.",
+                    ))
 
                     st.markdown("##### 🏭 Proveedor y logística")
                     d1, d2 = st.columns(2)
@@ -4909,7 +4933,7 @@ def render_movement_crud_controls(storage, data: Dict[str, pd.DataFrame]) -> Non
                         nuevo_lote  = e1.text_input("Lote", value=val_lote)
                         nueva_marca = e2.text_input("Marca", value=val_marca)
                         e3, e4 = st.columns(2)
-                        nueva_venc = e3.text_input("Fecha de vencimiento", value=val_venc, help="Formato YYYY-MM-DD.")
+                        nueva_venc = date_a_iso(e3.date_input("Fecha de vencimiento", value=fecha_a_date(val_venc), help="Debe coincidir con el lote del que salió el producto."))
                         nuevo_oc   = e4.text_input("Orden de compra", value=val_oc, help="Aparece en el acta de entrega.")
                     new_values = {
                         "cantidad": nueva_cantidad, "fecha": nueva_fecha,
@@ -4934,7 +4958,7 @@ def render_movement_crud_controls(storage, data: Dict[str, pd.DataFrame]) -> Non
                         e1, e2 = st.columns(2)
                         nuevo_lote  = e1.text_input("Lote", value=val_lote)
                         nueva_marca = e2.text_input("Marca", value=val_marca)
-                        nueva_venc = st.text_input("Fecha de vencimiento", value=val_venc, help="Formato YYYY-MM-DD.")
+                        nueva_venc = date_a_iso(st.date_input("Fecha de vencimiento", value=fecha_a_date(val_venc), help="Debe coincidir con el lote devuelto."))
                     new_values = {
                         "cantidad": nueva_cantidad, "fecha": nueva_fecha,
                         "solicitante": nuevo_solic, "personal": nuevo_pers,
@@ -4951,7 +4975,7 @@ def render_movement_crud_controls(storage, data: Dict[str, pd.DataFrame]) -> Non
                     )
                     with st.expander("✏️ Corregir fecha de vencimiento del lote"):
                         st.caption("La fecha de vencimiento debe coincidir con el lote afectado.")
-                        nueva_venc = st.text_input("Fecha de vencimiento", value=val_venc, help="Formato YYYY-MM-DD.")
+                        nueva_venc = date_a_iso(st.date_input("Fecha de vencimiento", value=fecha_a_date(val_venc), help="Seleccione la fecha en el calendario."))
                     new_values = {
                         "cantidad": nueva_cantidad, "fecha": nueva_fecha,
                         "observacion": nueva_obs,
