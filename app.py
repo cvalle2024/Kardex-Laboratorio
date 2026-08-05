@@ -4301,10 +4301,24 @@ def page_resumen_entregas(data: Dict[str, pd.DataFrame]) -> None:
         sorted(salidas["solicitante"].dropna().astype(str).unique().tolist()),
         key="entregas_sitios",
     )
-    productos = st.multiselect(
+    f5, f6 = st.columns(2)
+    productos = f5.multiselect(
         "Producto o insumo",
         sorted(salidas["producto"].dropna().astype(str).unique().tolist()),
         key="entregas_productos",
+    )
+    ordenes_compra = f6.multiselect(
+        "Orden de compra",
+        sorted(
+            salidas["orden_compra"]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .loc[lambda serie: serie.ne("")]
+            .unique()
+            .tolist()
+        ),
+        key="entregas_ordenes_compra",
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -4322,6 +4336,8 @@ def page_resumen_entregas(data: Dict[str, pd.DataFrame]) -> None:
         filtro = filtro[filtro["solicitante"].isin(sitios)]
     if productos:
         filtro = filtro[filtro["producto"].isin(productos)]
+    if ordenes_compra:
+        filtro = filtro[filtro["orden_compra"].astype(str).str.strip().isin(ordenes_compra)]
 
     sitios_count = filtro["solicitante"].replace("", np.nan).nunique()
     productos_count = filtro["producto"].replace("", np.nan).nunique()
