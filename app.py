@@ -78,7 +78,7 @@ SHEET_COLUMNS: Dict[str, List[str]] = {
         "proveedor", "orden_compra", "solicitante", "personal", "fecha_elaboracion", "fecha_vencimiento",
         "unidad", "cantidad", "costo_total", "observacion", "usuario_registro", "fecha_registro", "acta_entrega_id",
         "estado_movimiento", "anulado_por", "fecha_anulacion", "motivo_anulacion",
-        "modificado_por", "fecha_modificacion", "motivo_modificacion", "recibe_nombre", "recibe_cargo"
+        "modificado_por", "fecha_modificacion", "motivo_modificacion"
     ],
     # Hoja física en Google Sheets/Excel. Se calcula automáticamente desde Movimientos.
     # Esta hoja permite ver el stock actual en la misma base, sin depender solo de la vista de Streamlit.
@@ -177,9 +177,8 @@ PAGE_MOVIMIENTOS = "4️⃣ Registrar movimientos"
 PAGE_KARDEX = "5️⃣ Kardex consolidado"
 PAGE_STOCK = "6️⃣ Stock y alertas"
 PAGE_DASHBOARD = "7️⃣ Dashboard ejecutivo"
-PAGE_ENTREGAS = "8️⃣ Resumen de entregas"
-PAGE_REPORTES = "9️⃣ Reportes y exportación"
-PAGE_IMPORTAR = "🔟 Importar Kardex anterior"
+PAGE_REPORTES = "8️⃣ Reportes y exportación"
+PAGE_IMPORTAR = "9️⃣ Importar Kardex anterior"
 
 NAV_PAGES = [
     PAGE_INICIO,
@@ -189,7 +188,6 @@ NAV_PAGES = [
     PAGE_KARDEX,
     PAGE_STOCK,
     PAGE_DASHBOARD,
-    PAGE_ENTREGAS,
     PAGE_REPORTES,
     PAGE_IMPORTAR,
 ]
@@ -3827,8 +3825,6 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
                     "usuario_registro": usuario,
                     "fecha_registro": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "acta_entrega_id": acta_id,
-                    "recibe_nombre": recibe_nombre,
-                    "recibe_cargo": recibe_cargo,
                 })
             storage.append_rows("Movimientos", rows)
             if generar_acta:
@@ -4244,152 +4240,6 @@ def page_stock(stock: pd.DataFrame) -> None:
         df[["estado", "producto", "marca", "lote", "fecha_vencimiento", "dias_para_vencer", "unidad", "ingreso_total", "salida_total", "stock_actual", "stock_minimo"]],
         use_container_width=True,
         hide_index=True,
-    )
-
-
-def page_resumen_entregas(data: Dict[str, pd.DataFrame]) -> None:
-    section_header(
-        "🚚 Resumen de entregas",
-        "Consulte los productos enviados por servicio de salud, sitio solicitante, producto y período.",
-    )
-
-    movimientos = ensure_columns(data.get("Movimientos", pd.DataFrame()), "Movimientos")
-    salidas = movimientos[
-        movimientos["tipo_movimiento"].astype(str).str.strip().str.lower().eq("salida")
-        & valid_movement_mask(movimientos)
-    ].copy()
-    if salidas.empty:
-        st.info("No hay entregas vigentes registradas.")
-        return
-
-    # El servicio/departamento y municipio viven en el catálogo del solicitante.
-    solicitantes = ensure_columns(data.get("Solicitantes", pd.DataFrame()), "Solicitantes")
-    ubicacion = (
-        solicitantes[["unidad_solicitante", "departamento", "municipio"]]
-        .drop_duplicates(subset=["unidad_solicitante"], keep="last")
-        .rename(columns={"departamento": "servicio_salud"})
-    )
-    salidas = salidas.merge(
-        ubicacion,
-        how="left",
-        left_on="solicitante",
-        right_on="unidad_solicitante",
-    )
-    salidas["fecha_dt"] = to_date(salidas["fecha"])
-    salidas["cantidad_num"] = to_number(salidas["cantidad"])
-    for col in ["servicio_salud", "municipio", "recibe_nombre", "recibe_cargo"]:
-        salidas[col] = salidas[col].fillna("").astype(str).str.strip()
-    salidas["servicio_salud"] = salidas["servicio_salud"].replace("", "Sin servicio asignado")
-    salidas["recibe_nombre"] = salidas["recibe_nombre"].replace("", "No registrado (histórico)")
-
-    fechas_validas = salidas["fecha_dt"].dropna()
-    fecha_inicial = fechas_validas.min().date() if not fechas_validas.empty else (TODAY - pd.Timedelta(days=365)).date()
-    fecha_final = fechas_validas.max().date() if not fechas_validas.empty else TODAY.date()
-
-    st.markdown("<div class='form-card'>", unsafe_allow_html=True)
-    f1, f2 = st.columns(2)
-    desde = f1.date_input("Desde", value=fecha_inicial, key="entregas_desde")
-    hasta = f2.date_input("Hasta", value=fecha_final, key="entregas_hasta")
-    f3, f4 = st.columns(2)
-    servicios = f3.multiselect(
-        "Servicio de salud / departamento",
-        sorted(salidas["servicio_salud"].dropna().unique().tolist()),
-        key="entregas_servicios",
-    )
-    sitios = f4.multiselect(
-        "Sitio / solicitante",
-        sorted(salidas["solicitante"].dropna().astype(str).unique().tolist()),
-        key="entregas_sitios",
-    )
-    productos = st.multiselect(
-        "Producto o insumo",
-        sorted(salidas["producto"].dropna().astype(str).unique().tolist()),
-        key="entregas_productos",
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    if desde > hasta:
-        st.error("La fecha inicial no puede ser posterior a la fecha final.")
-        return
-
-    filtro = salidas[
-        (salidas["fecha_dt"] >= pd.Timestamp(desde))
-        & (salidas["fecha_dt"] <= pd.Timestamp(hasta))
-    ].copy()
-    if servicios:
-        filtro = filtro[filtro["servicio_salud"].isin(servicios)]
-    if sitios:
-        filtro = filtro[filtro["solicitante"].isin(sitios)]
-    if productos:
-        filtro = filtro[filtro["producto"].isin(productos)]
-
-    sitios_count = filtro["solicitante"].replace("", np.nan).nunique()
-    productos_count = filtro["producto"].replace("", np.nan).nunique()
-    k1, k2, k3, k4 = st.columns(4)
-    with k1:
-        kpi_card("Entregas", f"{len(filtro):,}", "Renglones despachados")
-    with k2:
-        kpi_card("Cantidad entregada", f"{filtro['cantidad_num'].sum():,.2f}", "Suma del filtro")
-    with k3:
-        kpi_card("Productos", f"{productos_count:,}", "Productos distintos")
-    with k4:
-        kpi_card("Sitios", f"{sitios_count:,}", "Solicitantes atendidos")
-
-    detalle = filtro[[
-        "producto", "marca", "lote", "fecha_vencimiento", "fecha", "cantidad_num", "unidad",
-        "recibe_nombre", "recibe_cargo", "orden_compra", "solicitante", "servicio_salud", "municipio",
-        "personal", "acta_entrega_id",
-    ]].copy()
-    detalle.columns = [
-        "Producto", "Marca", "Lote", "Fecha de vencimiento", "Fecha de entrega", "Cantidad entregada", "Unidad",
-        "Quién recibió", "Cargo de quien recibió", "Orden de compra", "Sitio / solicitante", "Servicio de salud",
-        "Municipio", "Quién entregó", "Acta de entrega",
-    ]
-    detalle = detalle.sort_values(["Fecha de entrega", "Sitio / solicitante", "Producto"], ascending=[False, True, True])
-
-    card_start("Detalle de productos enviados", f"Registros encontrados: {len(detalle):,}")
-    if detalle.empty:
-        st.info("No hay entregas para los filtros seleccionados.")
-    else:
-        st.dataframe(
-            detalle,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Cantidad entregada": st.column_config.NumberColumn(format="%.2f"),
-                "Quién recibió": st.column_config.TextColumn(width="medium"),
-                "Producto": st.column_config.TextColumn(width="large"),
-            },
-        )
-
-    resumen = (
-        filtro.groupby(["producto", "marca", "unidad"], dropna=False, as_index=False)["cantidad_num"]
-        .sum()
-        .rename(columns={
-            "producto": "Producto", "marca": "Marca", "unidad": "Unidad",
-            "cantidad_num": "Cantidad total entregada",
-        })
-        .sort_values(["Cantidad total entregada", "Producto"], ascending=[False, True])
-    )
-    card_start("Resumen de cantidades entregadas", "Totales por producto, marca y unidad según los filtros aplicados.")
-    st.dataframe(
-        resumen,
-        use_container_width=True,
-        hide_index=True,
-        column_config={"Cantidad total entregada": st.column_config.NumberColumn(format="%.2f")},
-    )
-
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        detalle.to_excel(writer, index=False, sheet_name="Detalle_Entregas")
-        resumen.to_excel(writer, index=False, sheet_name="Resumen_Productos")
-    output.seek(0)
-    st.download_button(
-        "⬇️ Descargar resumen de entregas en Excel",
-        data=output.read(),
-        file_name=f"resumen_entregas_{pd.Timestamp(desde).strftime('%Y%m%d')}_{pd.Timestamp(hasta).strftime('%Y%m%d')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
     )
 
 
@@ -5823,7 +5673,7 @@ def main() -> None:
         st.session_state["page"] = page
         st.divider()
         st.markdown("**Estructura lógica**")
-        st.caption("1. Acceso → 2. Catálogos → 3. Movimientos → 4. Kardex/Stock → 5. Entregas/Reportes")
+        st.caption("1. Acceso → 2. Catálogos → 3. Movimientos → 4. Kardex/Stock → 5. Reportes")
         st.divider()
         if st.button("Cerrar sesión", use_container_width=True):
             logout()
@@ -5843,8 +5693,6 @@ def main() -> None:
         page_stock(stock)
     elif page == PAGE_DASHBOARD:
         page_dashboard(data, stock)
-    elif page == PAGE_ENTREGAS:
-        page_resumen_entregas(data)
     elif page == PAGE_REPORTES:
         page_reportes(data, stock, kardex)
     elif page == PAGE_IMPORTAR:
