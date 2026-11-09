@@ -54,7 +54,7 @@ SHEET_COLUMNS: Dict[str, List[str]] = {
     "Productos": [
         "producto_id", "codigo_producto", "nombre_producto", "categoria", "marca_default",
         "unidad_default", "stock_minimo", "dias_alerta_vencimiento", "activo", "observacion",
-        "estado_registro", "creado_por", "fecha_creacion", "modificado_por", "fecha_modificacion", "motivo_modificacion"
+        "estado_registro", "creado_por", "fecha_creacion", "modificado_por", "fecha_modificacion", "motivo_modificacion", "orden_compra"
     ],
     "Proveedores": [
         "proveedor_id", "proveedor", "descripcion", "ruc", "representante", "telefono",
@@ -1078,6 +1078,25 @@ class GoogleSheetsStorage:
                     ) from exc
                 if "unable to parse range" not in msg:
                     raise
+
+        # Migración no destructiva: el catálogo Productos incorpora orden_compra
+        # al FINAL de las columnas. Las hojas antiguas pueden tener menos columnas.
+        if sheet == "Productos":
+            metadata = self._request(
+                "get", f"{self.base_url}?fields=sheets(properties(sheetId,title,gridProperties(columnCount)))"
+            )
+            for hoja in metadata.get("sheets", []):
+                props = hoja.get("properties", {})
+                if props.get("title") != sheet:
+                    continue
+                columnas_actuales = int(props.get("gridProperties", {}).get("columnCount", 0))
+                columnas_requeridas = len(SHEET_COLUMNS[sheet])
+                if columnas_actuales < columnas_requeridas:
+                    self._request("post", f"{self.base_url}:batchUpdate", json={"requests": [{
+                        "appendDimension": {"sheetId": props["sheetId"], "dimension": "COLUMNS",
+                                            "length": columnas_requeridas - columnas_actuales}
+                    }]})
+                break
 
         header_range = quote(f"'{sheet}'!A1:{column_letter(len(SHEET_COLUMNS[sheet]))}1", safe="")
         url = f"{self.base_url}/values/{header_range}?valueInputOption=USER_ENTERED"
@@ -3173,6 +3192,7 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
 
     def _product_card(prod_row: pd.Series, titulo: str = "Ficha del producto tomada del catálogo") -> None:
         codigo = clean_str(prod_row.get("codigo_producto", "")) or "Sin código"
+        oc_ficha = clean_str(prod_row.get("orden_compra", "")) or "Sin OC"
         nombre = clean_str(prod_row.get("nombre_producto", "")) or "Sin nombre"
         categoria = clean_str(prod_row.get("categoria", "")) or "Sin categoría"
         marca_default = clean_str(prod_row.get("marca_default", "")) or "Sin marca predeterminada"
@@ -3187,6 +3207,7 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
                 <div style="color:#F8FAFC; font-size:18px; font-weight:900; margin:3px 0 8px 0;">{nombre}</div>
                 <div style="display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:8px;">
                     <div class="field-note"><b>Código</b><br>{codigo}</div>
+                    <div class="field-note"><b>Orden de compra</b><br>{oc_ficha}</div>
                     <div class="field-note"><b>Categoría</b><br>{categoria}</div>
                     <div class="field-note"><b>Marca</b><br>{marca_default}</div>
                     <div class="field-note"><b>Unidad</b><br>{unidad_default}</div>
@@ -3303,14 +3324,12 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             "<div class='step-title'><span class='step-badge'>1</span>Producto del catálogo</div>",
             unsafe_allow_html=True
         )
-        productos_ord = productos.sort_values(["nombre_producto", "codigo_producto"], na_position="last")
-        labels = productos_ord.apply(
-            lambda r: f"{clean_str(r['nombre_producto'])} | Código: {clean_str(r['codigo_producto']) or 'Sin código'} | Marca: {clean_str(r['marca_default']) or 'Sin marca'}",
-            axis=1,
-        ).tolist()
-        producto_label = st.selectbox("Producto / reactivo / insumo registrado en catálogo", labels)
-        prod_row = productos_ord.iloc[labels.index(producto_label)]
-        producto_id = clean_str(prod_row["producto_id"])
+        producto_id = seleccionar_producto_tres_columnas(productos, "ingreso_mov")
+        if not producto_id:
+            st.info("Seleccione un producto por ID, código o nombre para registrar el ingreso.")
+            st.markdown("</div>", unsafe_allow_html=True)
+            return
+        prod_row = _catalog_row_by_id(producto_id)
         producto = clean_str(prod_row["nombre_producto"])
         marca_default = clean_str(prod_row.get("marca_default", ""))
         unidad_default = clean_str(prod_row.get("unidad_default", ""))
@@ -3350,7 +3369,7 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             )
             g, h, i = st.columns(3)
             proveedor = g.selectbox("Proveedor *", [""] + proveedores["proveedor"].dropna().astype(str).sort_values().tolist())
-            orden_compra = h.text_input("Orden de compra", placeholder="Ejemplo: OC-2026-001")
+            orden_compra = h.text_input("Orden de compra", value=clean_str(prod_row.get("orden_compra", "")), placeholder="Ejemplo: OC-2026-001", help="Debe corresponder a la orden de compra de este producto en el catálogo.")
             personal = i.selectbox("Personal que recibe", [""] + personal_df["nombre"].dropna().astype(str).sort_values().tolist())
             observacion = st.text_area("Observación", placeholder="Detalle de factura, donación, compra u otra referencia.")
             submitted = st.form_submit_button("💾 Guardar ingreso →", use_container_width=True)
@@ -3367,6 +3386,14 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
                 return
             if not proveedor:
                 st.error("⚠️ Para ingresos debe seleccionar proveedor.")
+                return
+            oc_catalogo = clean_str(prod_row.get("orden_compra", ""))
+            if producto_clave_catalogo(producto, orden_compra)[1] != producto_clave_catalogo(producto, oc_catalogo)[1]:
+                st.error(
+                    "La orden de compra del ingreso no coincide con la del producto seleccionado "
+                    f"({oc_catalogo or 'sin OC'}). Cree un nuevo producto en el catálogo "
+                    "con el mismo nombre y la nueva orden de compra, y selecciónelo para el ingreso."
+                )
                 return
             if not producto_activo_en_catalogo(data.get("Productos", pd.DataFrame()), producto_id):
                 st.error(
@@ -3428,6 +3455,11 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
                 return
             pay_producto_id = clean_str(_pay.get("producto_id", ""))
             pay_lote = clean_str(_pay.get("lote", ""))
+            _catalogo_actual = ensure_columns(data.get("Productos", pd.DataFrame()), "Productos")
+            _fila_actual = _catalogo_actual[_catalogo_actual["producto_id"].astype(str).str.strip().eq(pay_producto_id)]
+            if _fila_actual.empty or producto_clave_catalogo("", _pay.get("orden_compra", ""))[1] != producto_clave_catalogo("", _fila_actual.iloc[0].get("orden_compra", ""))[1]:
+                st.error("La orden de compra ya no coincide con la ficha del producto. Revise el catálogo.")
+                return
             if not producto_activo_en_catalogo(data.get("Productos", pd.DataFrame()), pay_producto_id):
                 st.error(
                     "⛔ No se guardó el ingreso porque el producto ya no está activo en catálogo. "
@@ -3485,200 +3517,148 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             st.markdown("</div>", unsafe_allow_html=True)
             return
 
-        st.markdown("<div class='form-card'>", unsafe_allow_html=True)
-        st.markdown("#### 1) Armar carrito de salida")
-        disponibles = stock[stock["stock_actual"] > 0].copy() if not stock.empty else pd.DataFrame()
-        if disponibles.empty:
-            productos_count = len(productos)
-            movimientos_count = len(movimientos)
-            tipos_mov = movimientos["tipo_movimiento"].astype(str).str.strip() if not movimientos.empty else pd.Series(dtype=str)
-            signos_mov = tipos_mov.apply(movimiento_sign) if not movimientos.empty else pd.Series(dtype=int)
-            ingresos_count = int((signos_mov > 0).sum()) if not movimientos.empty else 0
-            salidas_count = int((signos_mov < 0).sum()) if not movimientos.empty else 0
-            stock_rows = len(stock) if not stock.empty else 0
-            kardex_sheet_rows = len(stock_kardex_sheet) if 'stock_kardex_sheet' in locals() and not stock_kardex_sheet.empty else 0
-            kardex_sheet_positive = int((to_number(stock_kardex_sheet["stock_actual"]) > 0).sum()) if 'stock_kardex_sheet' in locals() and not stock_kardex_sheet.empty else 0
+        with st.container(border=True):
+            st.markdown("#### 1) Armar carrito de salida")
+            disponibles = stock[stock["stock_actual"] > 0].copy() if not stock.empty else pd.DataFrame()
+            if disponibles.empty:
+                productos_count = len(productos)
+                movimientos_count = len(movimientos)
+                tipos_mov = movimientos["tipo_movimiento"].astype(str).str.strip() if not movimientos.empty else pd.Series(dtype=str)
+                signos_mov = tipos_mov.apply(movimiento_sign) if not movimientos.empty else pd.Series(dtype=int)
+                ingresos_count = int((signos_mov > 0).sum()) if not movimientos.empty else 0
+                salidas_count = int((signos_mov < 0).sum()) if not movimientos.empty else 0
+                stock_rows = len(stock) if not stock.empty else 0
+                kardex_sheet_rows = len(stock_kardex_sheet) if 'stock_kardex_sheet' in locals() and not stock_kardex_sheet.empty else 0
+                kardex_sheet_positive = int((to_number(stock_kardex_sheet["stock_actual"]) > 0).sum()) if 'stock_kardex_sheet' in locals() and not stock_kardex_sheet.empty else 0
 
-            st.error("No hay lotes con stock disponible para registrar salidas.")
-            st.warning(
-                "Tener productos registrados en el catálogo no significa que exista stock disponible. "
-                "La salida solo se habilita cuando el sistema encuentra movimientos de ingreso, devolución o corrección de entrada con saldo mayor a cero."
-            )
-            diag_df = pd.DataFrame([
-                {"Validación": "Productos en catálogo", "Cantidad": productos_count, "Interpretación": "Son datos maestros; no generan existencia por sí solos."},
-                {"Validación": "Movimientos registrados", "Cantidad": movimientos_count, "Interpretación": "Bitácora transaccional usada para calcular stock."},
-                {"Validación": "Movimientos que suman stock", "Cantidad": ingresos_count, "Interpretación": "Ingreso, Devolución o Corrección entrada."},
-                {"Validación": "Movimientos que restan stock", "Cantidad": salidas_count, "Interpretación": "Salida o Corrección salida."},
-                {"Validación": "Lotes calculados en stock", "Cantidad": stock_rows, "Interpretación": "Filas generadas desde movimientos por producto/lote."},
-                {"Validación": "Lotes con saldo > 0 desde Movimientos", "Cantidad": 0, "Interpretación": "Por eso no aparece el carrito de salida."},
-                {"Validación": "Filas en hoja Kardex_Consolidado", "Cantidad": kardex_sheet_rows, "Interpretación": "Hoja calculada/visual en Google Sheets."},
-                {"Validación": "Saldos > 0 en Kardex_Consolidado", "Cantidad": kardex_sheet_positive, "Interpretación": "Si aquí hay saldos pero no en Movimientos, debe reconstruirse la hoja desde Movimientos o revisar tipos/cantidades."},
-            ])
-            st.dataframe(diag_df, use_container_width=True, hide_index=True)
-
-            if productos_count > 0 and ingresos_count == 0:
-                st.info(
-                    "Siguiente paso recomendado: registre primero un movimiento de tipo Ingreso para el producto/lote. "
-                    "Después de guardar el ingreso, el lote aparecerá automáticamente en Salida."
-                )
-            elif ingresos_count > 0 and stock_rows == 0:
-                st.info(
-                    "Hay ingresos registrados, pero no se logró construir stock. Revise que los movimientos tengan producto, lote, unidad, cantidad y tipo_movimiento correctos."
-                )
-            elif stock_rows > 0:
-                st.info(
-                    "El sistema sí calculó lotes desde Movimientos, pero todos tienen saldo cero o negativo. Revise el Kardex consolidado para confirmar consumo total."
-                )
-
-            if kardex_sheet_positive > 0 and ingresos_count == 0:
+                st.error("No hay lotes con stock disponible para registrar salidas.")
                 st.warning(
-                    "Se detectan saldos positivos en la hoja física Kardex_Consolidado, pero no hay ingresos válidos en Movimientos. "
-                    "Para hacer salidas seguras, el sistema necesita movimientos de ingreso/devolución/corrección entrada, porque Movimientos es la bitácora oficial. "
-                    "Revise que los tipos de movimiento estén escritos como Ingreso, Entrada, Devolución o Corrección entrada y que cantidad sea numérica."
+                    "Tener productos registrados en el catálogo no significa que exista stock disponible. "
+                    "La salida solo se habilita cuando el sistema encuentra movimientos de ingreso, devolución o corrección de entrada con saldo mayor a cero."
                 )
-
-            if st.button("🔄 Actualizar datos desde Google Sheets", use_container_width=True):
-                mark_data_dirty()
-                rerun()
-            st.markdown("</div>", unsafe_allow_html=True)
-            return
-
-        if "salida_cart" not in st.session_state:
-            st.session_state["salida_cart"] = []
-
-        disponibles = disponibles.sort_values(["producto", "fecha_vencimiento", "lote"], na_position="last").reset_index(drop=True)
-        disponibles["label"] = disponibles.apply(
-            lambda r: f"{r['producto']} | Marca: {r['marca']} | Lote: {r['lote']} | Vence: {r['fecha_vencimiento']} | Stock: {float(r['stock_actual']):,.0f} {r['unidad']}",
-            axis=1,
-        )
-
-        # Dos formas sincronizadas de encontrar el mismo producto:
-        # columna 1 = producto_id; columna 2 = nombre del producto.
-        # Se filtran lotes por ID para evitar confundir nombres repetidos.
-        catalogo_selector = (
-            disponibles[["producto_id", "producto"]]
-            .fillna("")
-            .astype(str)
-            .apply(lambda col: col.str.strip())
-        )
-        catalogo_selector = catalogo_selector[
-            catalogo_selector["producto_id"].ne("")
-        ].drop_duplicates(subset=["producto_id"]).sort_values(["producto", "producto_id"])
-        id_a_nombre = dict(zip(catalogo_selector["producto_id"], catalogo_selector["producto"]))
-        # Si dos IDs tienen el mismo nombre, se incluye el ID al mostrarlo.
-        nombres_repetidos = catalogo_selector["producto"].value_counts()
-        id_a_etiqueta = {
-            pid: (f"{nombre} ({pid})" if nombres_repetidos.get(nombre, 0) > 1 else nombre)
-            for pid, nombre in id_a_nombre.items()
-        }
-        etiqueta_a_id = {etiqueta: pid for pid, etiqueta in id_a_etiqueta.items()}
-        ids_opciones = ["Todos"] + sorted(id_a_nombre)
-        nombres_opciones = ["Todos"] + sorted(etiqueta_a_id, key=str.casefold)
-
-        if st.session_state.get("sel_producto_id_carrito") not in ids_opciones:
-            st.session_state["sel_producto_id_carrito"] = "Todos"
-        if st.session_state.get("sel_producto_carrito") not in nombres_opciones:
-            st.session_state["sel_producto_carrito"] = "Todos"
-
-        def _sincronizar_desde_id():
-            seleccionado = st.session_state["sel_producto_id_carrito"]
-            st.session_state["sel_producto_carrito"] = id_a_etiqueta.get(seleccionado, "Todos")
-
-        def _sincronizar_desde_nombre():
-            seleccionado = st.session_state["sel_producto_carrito"]
-            st.session_state["sel_producto_id_carrito"] = etiqueta_a_id.get(seleccionado, "Todos")
-
-        col_id_producto, col_nombre_producto = st.columns(2)
-        with col_id_producto:
-            filtro_producto_id = st.selectbox(
-                "producto_id",
-                ids_opciones,
-                key="sel_producto_id_carrito",
-                on_change=_sincronizar_desde_id,
-                help="Busque el producto por su identificador único.",
-            )
-        with col_nombre_producto:
-            st.selectbox(
-                "Producto",
-                nombres_opciones,
-                key="sel_producto_carrito",
-                on_change=_sincronizar_desde_nombre,
-                help="Busque por nombre; el producto_id se actualizará automáticamente.",
-            )
-
-        lotes_view = disponibles.copy()
-        if filtro_producto_id != "Todos":
-            lotes_view = lotes_view[
-                lotes_view["producto_id"].astype(str).str.strip() == filtro_producto_id
-            ]
-
-        # Mostrar info del lote seleccionado antes del form
-        lotes_opciones = lotes_view["label"].tolist()
-
-        # ── Form de cantidad: solo lote y cantidad, el producto ya está fijo ──
-        with st.form("frm_add_cart_salida", clear_on_submit=True):
-            clote, ccant = st.columns([2.5, .8])
-            label = clote.selectbox(
-                "Lote disponible",
-                lotes_opciones if lotes_opciones else ["— Sin lotes disponibles —"],
-                help="Lotes filtrados según el producto seleccionado arriba.",
-            )
-            cantidad_item = ccant.number_input("Cantidad", min_value=0.0, step=1.0, format="%.2f")
-            add_item = st.form_submit_button("➕ Agregar al carrito", use_container_width=True)
-
-        # Buscar la fila seleccionada DESPUÉS del form
-        selected_stock_row = None
-        if lotes_opciones and label in lotes_view["label"].values:
-            selected_stock_row = lotes_view[lotes_view["label"] == label].iloc[0]
-
-        if add_item:
-            if not lotes_opciones or selected_stock_row is None:
-                st.error("⚠️ No hay lotes disponibles para el producto seleccionado.")
-            elif cantidad_item <= 0:
-                st.error("⚠️ Ingrese una cantidad mayor a cero.")
-            else:
-                item_key = "|".join([
-                    clean_str(selected_stock_row.get("producto_id", "")), clean_str(selected_stock_row.get("lote", "")),
-                    clean_str(selected_stock_row.get("marca", "")), clean_str(selected_stock_row.get("fecha_vencimiento", "")),
+                diag_df = pd.DataFrame([
+                    {"Validación": "Productos en catálogo", "Cantidad": productos_count, "Interpretación": "Son datos maestros; no generan existencia por sí solos."},
+                    {"Validación": "Movimientos registrados", "Cantidad": movimientos_count, "Interpretación": "Bitácora transaccional usada para calcular stock."},
+                    {"Validación": "Movimientos que suman stock", "Cantidad": ingresos_count, "Interpretación": "Ingreso, Devolución o Corrección entrada."},
+                    {"Validación": "Movimientos que restan stock", "Cantidad": salidas_count, "Interpretación": "Salida o Corrección salida."},
+                    {"Validación": "Lotes calculados en stock", "Cantidad": stock_rows, "Interpretación": "Filas generadas desde movimientos por producto/lote."},
+                    {"Validación": "Lotes con saldo > 0 desde Movimientos", "Cantidad": 0, "Interpretación": "Por eso no aparece el carrito de salida."},
+                    {"Validación": "Filas en hoja Kardex_Consolidado", "Cantidad": kardex_sheet_rows, "Interpretación": "Hoja calculada/visual en Google Sheets."},
+                    {"Validación": "Saldos > 0 en Kardex_Consolidado", "Cantidad": kardex_sheet_positive, "Interpretación": "Si aquí hay saldos pero no en Movimientos, debe reconstruirse la hoja desde Movimientos o revisar tipos/cantidades."},
                 ])
-                ya_en_carrito = sum(float(x.get("cantidad", 0) or 0) for x in st.session_state["salida_cart"] if x.get("item_key") == item_key)
-                disponible = float(selected_stock_row.get("stock_actual", 0) or 0)
-                if ya_en_carrito + cantidad_item > disponible:
-                    st.error(f"No puede agregar {cantidad_item:,.0f}; ya tiene {ya_en_carrito:,.0f} en el carrito y el stock disponible es {disponible:,.0f}.")
-                else:
-                    prod_info_item = _catalog_row_by_id(clean_str(selected_stock_row.get("producto_id", "")))
-                    st.session_state["salida_cart"].append({
-                        "item_key": item_key,
-                        "producto_id": clean_str(selected_stock_row["producto_id"]),
-                        "producto": clean_str(selected_stock_row["producto"]),
-                        "marca": clean_str(selected_stock_row["marca"]),
-                        "lote": clean_str(selected_stock_row["lote"]),
-                        "fecha_vencimiento": format_date(selected_stock_row["fecha_vencimiento"]),
-                        "unidad": clean_str(selected_stock_row["unidad"]),
-                        "categoria": clean_str(prod_info_item.get("categoria", "")),
-                        # Orden de compra heredada del ingreso del lote (para imprimirla en el acta).
-                        "orden_compra": clean_str(selected_stock_row.get("orden_compra_ingreso", "")),
-                        "cantidad": cantidad_item,
-                        "stock_disponible": disponible,
-                    })
-                    st.success("Producto agregado al carrito.")
-                    rerun()
+                st.dataframe(diag_df, use_container_width=True, hide_index=True)
 
-        cart = st.session_state.get("salida_cart", [])
-        if cart:
-            st.markdown("#### 2) Productos seleccionados para la salida")
-            cart_df = pd.DataFrame(cart).drop(columns=["item_key"], errors="ignore")
-            cart_df.insert(0, "item_no", range(1, len(cart_df) + 1))
-            st.dataframe(cart_df, use_container_width=True, hide_index=True)
-            r1, r2 = st.columns([1, 2])
-            quitar = r1.selectbox("Quitar item", [""] + [str(i) for i in range(1, len(cart) + 1)])
-            if r2.button("🗑️ Quitar del carrito", use_container_width=True, disabled=(not quitar)):
-                idx = int(quitar) - 1
-                st.session_state["salida_cart"].pop(idx)
-                rerun()
-        else:
-            st.info("Agregue uno o varios productos al carrito. Al guardar la salida, cada producto se registrará como una fila individual en Movimientos.")
-        st.markdown("</div>", unsafe_allow_html=True)
+                if productos_count > 0 and ingresos_count == 0:
+                    st.info(
+                        "Siguiente paso recomendado: registre primero un movimiento de tipo Ingreso para el producto/lote. "
+                        "Después de guardar el ingreso, el lote aparecerá automáticamente en Salida."
+                    )
+                elif ingresos_count > 0 and stock_rows == 0:
+                    st.info(
+                        "Hay ingresos registrados, pero no se logró construir stock. Revise que los movimientos tengan producto, lote, unidad, cantidad y tipo_movimiento correctos."
+                    )
+                elif stock_rows > 0:
+                    st.info(
+                        "El sistema sí calculó lotes desde Movimientos, pero todos tienen saldo cero o negativo. Revise el Kardex consolidado para confirmar consumo total."
+                    )
+
+                if kardex_sheet_positive > 0 and ingresos_count == 0:
+                    st.warning(
+                        "Se detectan saldos positivos en la hoja física Kardex_Consolidado, pero no hay ingresos válidos en Movimientos. "
+                        "Para hacer salidas seguras, el sistema necesita movimientos de ingreso/devolución/corrección entrada, porque Movimientos es la bitácora oficial. "
+                        "Revise que los tipos de movimiento estén escritos como Ingreso, Entrada, Devolución o Corrección entrada y que cantidad sea numérica."
+                    )
+
+                if st.button("🔄 Actualizar datos desde Google Sheets", use_container_width=True):
+                    mark_data_dirty()
+                    rerun()
+                return
+
+            if "salida_cart" not in st.session_state:
+                st.session_state["salida_cart"] = []
+
+            disponibles = disponibles.sort_values(["producto", "fecha_vencimiento", "lote"], na_position="last").reset_index(drop=True)
+            disponibles["label"] = disponibles.apply(
+                lambda r: f"{r['producto']} | Marca: {r['marca']} | Lote: {r['lote']} | Vence: {r['fecha_vencimiento']} | Stock: {float(r['stock_actual']):,.0f} {r['unidad']}",
+                axis=1,
+            )
+
+            ids_stock = set(disponibles["producto_id"].astype(str).str.strip())
+            catalogo_salida = productos[productos["producto_id"].astype(str).str.strip().isin(ids_stock)]
+            filtro_producto_id = seleccionar_producto_tres_columnas(catalogo_salida, "salida_carrito", permitir_todos=True)
+
+            lotes_view = disponibles.copy()
+            if filtro_producto_id:
+                lotes_view = lotes_view[
+                    lotes_view["producto_id"].astype(str).str.strip() == filtro_producto_id
+                ]
+
+            # Mostrar info del lote seleccionado antes del form
+            lotes_opciones = lotes_view["label"].tolist()
+
+            # ── Form de cantidad: solo lote y cantidad, el producto ya está fijo ──
+            with st.form("frm_add_cart_salida", clear_on_submit=True):
+                clote, ccant = st.columns([2.5, .8])
+                label = clote.selectbox(
+                    "Lote disponible",
+                    lotes_opciones if lotes_opciones else ["— Sin lotes disponibles —"],
+                    help="Lotes filtrados según el producto seleccionado arriba.",
+                )
+                cantidad_item = ccant.number_input("Cantidad", min_value=0.0, step=1.0, format="%.2f")
+                add_item = st.form_submit_button("➕ Agregar al carrito", use_container_width=True)
+
+            # Buscar la fila seleccionada DESPUÉS del form
+            selected_stock_row = None
+            if lotes_opciones and label in lotes_view["label"].values:
+                selected_stock_row = lotes_view[lotes_view["label"] == label].iloc[0]
+
+            if add_item:
+                if not lotes_opciones or selected_stock_row is None:
+                    st.error("⚠️ No hay lotes disponibles para el producto seleccionado.")
+                elif cantidad_item <= 0:
+                    st.error("⚠️ Ingrese una cantidad mayor a cero.")
+                else:
+                    item_key = "|".join([
+                        clean_str(selected_stock_row.get("producto_id", "")), clean_str(selected_stock_row.get("lote", "")),
+                        clean_str(selected_stock_row.get("marca", "")), clean_str(selected_stock_row.get("fecha_vencimiento", "")),
+                    ])
+                    ya_en_carrito = sum(float(x.get("cantidad", 0) or 0) for x in st.session_state["salida_cart"] if x.get("item_key") == item_key)
+                    disponible = float(selected_stock_row.get("stock_actual", 0) or 0)
+                    if ya_en_carrito + cantidad_item > disponible:
+                        st.error(f"No puede agregar {cantidad_item:,.0f}; ya tiene {ya_en_carrito:,.0f} en el carrito y el stock disponible es {disponible:,.0f}.")
+                    else:
+                        prod_info_item = _catalog_row_by_id(clean_str(selected_stock_row.get("producto_id", "")))
+                        st.session_state["salida_cart"].append({
+                            "item_key": item_key,
+                            "producto_id": clean_str(selected_stock_row["producto_id"]),
+                            "producto": clean_str(selected_stock_row["producto"]),
+                            "marca": clean_str(selected_stock_row["marca"]),
+                            "lote": clean_str(selected_stock_row["lote"]),
+                            "fecha_vencimiento": format_date(selected_stock_row["fecha_vencimiento"]),
+                            "unidad": clean_str(selected_stock_row["unidad"]),
+                            "categoria": clean_str(prod_info_item.get("categoria", "")),
+                            # Orden de compra heredada del ingreso del lote (para imprimirla en el acta).
+                            "orden_compra": clean_str(selected_stock_row.get("orden_compra_ingreso", "")),
+                            "cantidad": cantidad_item,
+                            "stock_disponible": disponible,
+                        })
+                        st.success("Producto agregado al carrito.")
+                        rerun()
+
+            cart = st.session_state.get("salida_cart", [])
+            if cart:
+                st.markdown("#### 2) Productos seleccionados para la salida")
+                cart_df = pd.DataFrame(cart).drop(columns=["item_key"], errors="ignore")
+                cart_df.insert(0, "item_no", range(1, len(cart_df) + 1))
+                st.dataframe(cart_df, use_container_width=True, hide_index=True)
+                r1, r2 = st.columns([1, 2])
+                quitar = r1.selectbox("Quitar item", [""] + [str(i) for i in range(1, len(cart) + 1)])
+                if r2.button("🗑️ Quitar del carrito", use_container_width=True, disabled=(not quitar)):
+                    idx = int(quitar) - 1
+                    st.session_state["salida_cart"].pop(idx)
+                    rerun()
+            else:
+                st.info("Agregue uno o varios productos al carrito. Al guardar la salida, cada producto se registrará como una fila individual en Movimientos.")
 
         # Panel de la última acta generada (sin bloqueo: aquí ya no hay acta pendiente,
         # porque el bloqueo de arriba retorna antes de llegar a este punto).
@@ -4032,16 +4012,21 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
         lambda r: f"{r['producto']} | Marca: {r['marca']} | Lote: {r['lote']} | Vence: {r['fecha_vencimiento']} | Stock: {float(r['stock_actual']):,.0f} {r['unidad']}",
         axis=1,
     )
-    labels_disponibles = disponibles["label"].dropna().astype(str).tolist()
-    if not labels_disponibles:
-        st.error("No hay productos/lotes válidos para seleccionar en la corrección.")
-        st.markdown("</div>", unsafe_allow_html=True)
+    ids_ajuste = set(disponibles["producto_id"].astype(str).str.strip())
+    catalogo_ajuste = productos[productos["producto_id"].astype(str).str.strip().isin(ids_ajuste)]
+    id_ajuste = seleccionar_producto_tres_columnas(catalogo_ajuste, "ajuste_mov")
+    if not id_ajuste:
+        st.info("Seleccione el producto por ID, código o nombre para continuar con el ajuste.")
         return
-    label = st.selectbox("Producto/lote a corregir", labels_disponibles)
-    selected_match = disponibles[disponibles["label"].astype(str) == str(label)]
+    disponibles_producto = disponibles[disponibles["producto_id"].astype(str).str.strip().eq(id_ajuste)]
+    labels_disponibles = disponibles_producto["label"].dropna().astype(str).tolist()
+    if not labels_disponibles:
+        st.warning("No hay lotes disponibles para ese producto.")
+        return
+    label = st.selectbox("Lote a corregir", labels_disponibles, key="ajuste_lote")
+    selected_match = disponibles_producto[disponibles_producto["label"].astype(str).eq(str(label))]
     if selected_match.empty:
-        st.warning("La selección ya no está disponible. Actualice datos desde Google Sheets e intente nuevamente.")
-        st.markdown("</div>", unsafe_allow_html=True)
+        st.warning("El lote ya no está disponible. Actualice los datos.")
         return
     selected = selected_match.iloc[0]
     prod_row = _catalog_row_by_id(clean_str(selected["producto_id"]))
@@ -4499,8 +4484,90 @@ def page_reportes(data: Dict[str, pd.DataFrame], stock: pd.DataFrame, kardex: pd
     )
 
 # ------------------------- CATÁLOGOS -------------------------
+def producto_clave_catalogo(nombre: str, orden: str) -> tuple[str, str]:
+    """Clave compuesta normalizada: no diferencia mayúsculas ni espacios redundantes."""
+    return (" ".join(clean_str(nombre).split()).casefold(),
+            " ".join(clean_str(orden).split()).casefold())
+
+
+def producto_duplicado_catalogo(df: pd.DataFrame, nombre: str, orden: str,
+                                excluir_id: str = "") -> pd.Series | None:
+    productos = ensure_columns(df, "Productos")
+    clave = producto_clave_catalogo(nombre, orden)
+    for _, fila in productos.iterrows():
+        if excluir_id and clean_str(fila.get("producto_id", "")) == excluir_id:
+            continue
+        if producto_clave_catalogo(fila.get("nombre_producto", ""), fila.get("orden_compra", "")) == clave:
+            return fila
+    return None
+
+
+def seleccionar_producto_tres_columnas(catalogo: pd.DataFrame, prefijo: str,
+                                       permitir_todos: bool = False) -> str:
+    """ID, código y nombre sincronizados; siempre devuelve el producto_id real."""
+    catalogo = ensure_columns(catalogo, "Productos").copy()
+    catalogo = catalogo[catalogo["producto_id"].astype(str).str.strip().ne("")]
+    catalogo = catalogo.drop_duplicates(subset=["producto_id"])
+    if catalogo.empty:
+        st.warning("No hay productos disponibles para seleccionar.")
+        return ""
+    ids = catalogo["producto_id"].astype(str).str.strip().tolist()
+    codigos = catalogo["codigo_producto"].fillna("").astype(str).str.strip().tolist()
+    nombres = catalogo["nombre_producto"].fillna("").astype(str).str.strip().tolist()
+    ordenes = catalogo["orden_compra"].fillna("").astype(str).str.strip().tolist()
+    id_cod = dict(zip(ids, codigos))
+    id_nom = dict(zip(ids, nombres))
+    id_oc = dict(zip(ids, ordenes))
+    # Código y nombre no necesariamente son únicos: añadir ID hace la selección inequívoca.
+    etiquetas_codigo = {pid: f"{id_cod[pid] or 'Sin código'} | {pid}" for pid in ids}
+    etiquetas_nombre = {
+        pid: f"{id_nom[pid] or 'Sin nombre'} | OC: {id_oc[pid] or 'Sin OC'} | {pid}"
+        for pid in ids
+    }
+    todos = "Todos" if permitir_todos else "Seleccione un producto"
+    opc_ids = [todos] + sorted(ids)
+    opc_cod = [todos] + sorted(etiquetas_codigo.values(), key=str.casefold)
+    opc_nom = [todos] + sorted(etiquetas_nombre.values(), key=str.casefold)
+    id_a_codigo = {pid: etiquetas_codigo[pid] for pid in ids}
+    id_a_nombre = {pid: etiquetas_nombre[pid] for pid in ids}
+    codigo_a_id = {val: pid for pid, val in id_a_codigo.items()}
+    nombre_a_id = {val: pid for pid, val in id_a_nombre.items()}
+    kid, kcod, knom = (f"{prefijo}_producto_id", f"{prefijo}_codigo_producto", f"{prefijo}_nombre_producto")
+    if st.session_state.get(kid) not in opc_ids:
+        st.session_state[kid] = todos
+    if st.session_state.get(kcod) not in opc_cod:
+        st.session_state[kcod] = todos
+    if st.session_state.get(knom) not in opc_nom:
+        st.session_state[knom] = todos
+
+    def desde_id():
+        pid = st.session_state[kid]
+        st.session_state[kcod] = id_a_codigo.get(pid, todos)
+        st.session_state[knom] = id_a_nombre.get(pid, todos)
+
+    def desde_codigo():
+        pid = codigo_a_id.get(st.session_state[kcod], todos)
+        st.session_state[kid] = pid
+        st.session_state[knom] = id_a_nombre.get(pid, todos)
+
+    def desde_nombre():
+        pid = nombre_a_id.get(st.session_state[knom], todos)
+        st.session_state[kid] = pid
+        st.session_state[kcod] = id_a_codigo.get(pid, todos)
+
+    col_id, col_codigo, col_nombre = st.columns(3)
+    col_id.selectbox("producto_id", opc_ids, key=kid, on_change=desde_id)
+    col_codigo.selectbox("Código del producto", opc_cod, key=kcod, on_change=desde_codigo)
+    col_nombre.selectbox("Producto", opc_nom, key=knom, on_change=desde_nombre)
+    return st.session_state[kid] if st.session_state[kid] != todos else ""
+
+
 def save_new_product(storage, data, values: dict) -> None:
-    df = ensure_columns(data["Productos"], "Productos")
+    df = ensure_columns(storage.load("Productos"), "Productos")
+    if not clean_str(values.get("nombre_producto", "")) or not clean_str(values.get("orden_compra", "")):
+        raise ValueError("Nombre y orden de compra son obligatorios.")
+    if producto_duplicado_catalogo(df, values["nombre_producto"], values["orden_compra"]) is not None:
+        raise ValueError("El producto con ese nombre y orden de compra ya existe.")
     row = {
         "producto_id": next_code("PRD", df, "producto_id", 4),
         **values,
@@ -4509,12 +4576,13 @@ def save_new_product(storage, data, values: dict) -> None:
 
 
 def product_form(storage, data: Dict[str, pd.DataFrame]) -> None:
-    card_start("Nuevo producto", "Registre productos con stock mínimo y días de alerta por vencimiento.")
+    card_start("Nuevo producto", "La identidad única se determina por nombre y orden de compra.")
     confirm_key = "crear_producto_catalogo"
     with st.form("frm_producto", clear_on_submit=True):
         c1, c2 = st.columns([1, 2])
         codigo = c1.text_input("Código interno", placeholder="Ejemplo: HIV-RAP-001")
         nombre = c2.text_input("Nombre del producto *", placeholder="Nombre completo del reactivo o insumo")
+        orden_compra_producto = st.text_input("Orden de compra *", placeholder="Ejemplo: OC-2026-001", help="Un mismo nombre con otra orden de compra corresponde a otro producto.")
         c3, c4, c5 = st.columns(3)
         categoria = c3.selectbox("Categoría", CATEGORIAS_DEFAULT)
         marca = c4.text_input("Marca predeterminada")
@@ -4526,12 +4594,17 @@ def product_form(storage, data: Dict[str, pd.DataFrame]) -> None:
         observacion = st.text_area("Observación")
         submitted = st.form_submit_button("➕ Guardar producto", use_container_width=True)
     if submitted:
-        if not nombre:
-            st.error("El nombre del producto es obligatorio.")
+        if not clean_str(nombre) or not clean_str(orden_compra_producto):
+            st.error("El nombre del producto y la orden de compra son obligatorios.")
+            return
+        duplicado = producto_duplicado_catalogo(data.get("Productos", pd.DataFrame()), nombre, orden_compra_producto)
+        if duplicado is not None:
+            st.error(f"Este producto ya existe con la misma orden de compra. ID existente: {clean_str(duplicado.get('producto_id', ''))}. No se permite duplicarlo.")
             return
         set_confirm_pending(confirm_key, {
             "codigo_producto": codigo or nombre[:18].upper().replace(" ", "-"),
             "nombre_producto": nombre,
+            "orden_compra": orden_compra_producto,
             "categoria": categoria,
             "marca_default": marca,
             "unidad_default": unidad,
@@ -4553,6 +4626,7 @@ def product_form(storage, data: Dict[str, pd.DataFrame]) -> None:
             body=(
                 f"<b>Producto:</b> {safe_html(payload.get('nombre_producto',''))}<br>"
                 f"<b>Código:</b> {safe_html(payload.get('codigo_producto',''))}<br>"
+                f"<b>Orden de compra:</b> {safe_html(payload.get('orden_compra',''))}<br>"
                 f"<b>Categoría:</b> {safe_html(payload.get('categoria',''))}<br>"
                 f"<b>Marca:</b> {safe_html(payload.get('marca_default','')) or '—'}<br>"
                 f"<b>Unidad:</b> {safe_html(payload.get('unidad_default',''))}<br>"
@@ -4563,6 +4637,12 @@ def product_form(storage, data: Dict[str, pd.DataFrame]) -> None:
             danger=False,
         )
         if not confirmed:
+            return
+        # Segunda validación justo antes de persistir (evita confirmar datos obsoletos).
+        catalogo_actual = storage.load("Productos")
+        duplicado = producto_duplicado_catalogo(catalogo_actual, payload.get("nombre_producto", ""), payload.get("orden_compra", ""))
+        if duplicado is not None:
+            st.error(f"Ya existe el producto con la misma orden de compra (ID: {clean_str(duplicado.get('producto_id', ''))}).")
             return
         save_new_product(storage, data, payload)
         set_flash("Producto guardado correctamente. El formulario quedó limpio para registrar un nuevo producto.")
@@ -4992,6 +5072,16 @@ def catalog_editor(storage, data: Dict[str, pd.DataFrame], sheet: str, title: st
         audit_rows = []
         action = "EDITAR_REGISTRO"
         if save_btn:
+            if sheet == "Productos":
+                nuevo_nombre = clean_str(values.get("nombre_producto", ""))
+                nueva_orden = clean_str(values.get("orden_compra", ""))
+                if not nuevo_nombre or not nueva_orden:
+                    st.error("Nombre y orden de compra son obligatorios para editar un producto. Complete primero la orden de compra del registro antiguo.")
+                    return
+                choque = producto_duplicado_catalogo(df, nuevo_nombre, nueva_orden, registro_id)
+                if choque is not None:
+                    st.error(f"Ya existe otro producto con el mismo nombre y orden de compra (ID: {clean_str(choque.get('producto_id', ''))}).")
+                    return
             for col, new_value in values.items():
                 old_value = clean_str(new_df.loc[mask, col].iloc[0]) if col in new_df.columns else ""
                 new_text = clean_str(new_value)
