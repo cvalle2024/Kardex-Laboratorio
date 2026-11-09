@@ -3644,7 +3644,7 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
         mov_nonce = int(st.session_state.get("mov_form_nonce", 0))
 
         # ── Paso 3: selección de sitio FUERA del form para auto-relleno ──────
-        st.markdown("<div class='form-card'>", unsafe_allow_html=True)
+        # Contenedor nativo: evita que Streamlit muestre un </div> suelto.
         st.markdown(
             "<div class='step-title'><span class='step-badge'>3</span>Sitio receptor y datos de entrega</div><hr class='step-divider'>",
             unsafe_allow_html=True,
@@ -3706,7 +3706,7 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
                 unsafe_allow_html=True,
             )
 
-        st.markdown("</div>", unsafe_allow_html=True)
+        # El bloque de sitio receptor no usa etiquetas HTML abiertas entre widgets.
 
         # ── Formulario principal de salida ────────────────────────────────────
         st.markdown("<div class='form-card'>", unsafe_allow_html=True)
