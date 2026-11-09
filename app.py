@@ -120,7 +120,7 @@ TIPOS_NEGATIVOS = {"Salida", "Corrección salida", "Ajuste salida"}
 CATEGORIAS_DEFAULT = ["Reactivo", "Insumo", "Equipo", "Material", "Papelería", "Otro"]
 UNIDADES_DEFAULT = [
     "TABLETAS", "FRASCOS", "RESMAS", "C/U", "SET", "ROLLOS", "PRUEBAS", "KIT",
-    "UNIDAD", "CAJAS", "CAJITAS", "BOLSAS", "AMPOLLAS", "TUBOS", "PAQUETE", "PLACAS", "ML", "L"
+    "UNIDAD", "CAJAS", "CAJA (250- UNIDADES)","CAJITAS", "BOLSAS", "BOLSA (1000-UNIDADES)","BOLSA (500-UNIDADES)", "AMPOLLAS", "TUBOS", "PAQUETE (100-UNIDADES)","PAQUETE (50-UNIDADES)", "PLACAS", "ML", "L"
 ]
 ROLES = ["Administrador", "Supervisor", "Operador", "Consulta"]
 
