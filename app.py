@@ -3207,7 +3207,7 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
                 <div style="color:#F8FAFC; font-size:18px; font-weight:900; margin:3px 0 8px 0;">{nombre}</div>
                 <div style="display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:8px;">
                     <div class="field-note"><b>Código</b><br>{codigo}</div>
-                    <div class="field-note"><b>Orden de compra</b><br>{oc_ficha}</div>
+                    <div class="field-note"><b>OC histórica (catálogo)</b><br>{oc_ficha}</div>
                     <div class="field-note"><b>Categoría</b><br>{categoria}</div>
                     <div class="field-note"><b>Marca</b><br>{marca_default}</div>
                     <div class="field-note"><b>Unidad</b><br>{unidad_default}</div>
@@ -3326,7 +3326,7 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
         )
         producto_id = seleccionar_producto_tres_columnas(productos, "ingreso_mov")
         if not producto_id:
-            st.info("Seleccione un producto por ID, código o nombre para registrar el ingreso.")
+            st.info("Seleccione el producto ya creado por ID, código o nombre. La nueva orden de compra se ingresa en este movimiento, sin duplicar el catálogo.")
             st.markdown("</div>", unsafe_allow_html=True)
             return
         prod_row = _catalog_row_by_id(producto_id)
@@ -3369,7 +3369,7 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             )
             g, h, i = st.columns(3)
             proveedor = g.selectbox("Proveedor *", [""] + proveedores["proveedor"].dropna().astype(str).sort_values().tolist())
-            orden_compra = h.text_input("Orden de compra", value=clean_str(prod_row.get("orden_compra", "")), placeholder="Ejemplo: OC-2026-001", help="Debe corresponder a la orden de compra de este producto en el catálogo.")
+            orden_compra = h.text_input("Orden de compra de este ingreso *", value="", placeholder="Ejemplo: OC-2026-001", help="Cada recepción lleva su propia orden de compra; no necesita crear otro producto aunque el lote sea igual.")
             personal = i.selectbox("Personal que recibe", [""] + personal_df["nombre"].dropna().astype(str).sort_values().tolist())
             observacion = st.text_area("Observación", placeholder="Detalle de factura, donación, compra u otra referencia.")
             submitted = st.form_submit_button("💾 Guardar ingreso →", use_container_width=True)
@@ -3387,13 +3387,8 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             if not proveedor:
                 st.error("⚠️ Para ingresos debe seleccionar proveedor.")
                 return
-            oc_catalogo = clean_str(prod_row.get("orden_compra", ""))
-            if producto_clave_catalogo(producto, orden_compra)[1] != producto_clave_catalogo(producto, oc_catalogo)[1]:
-                st.error(
-                    "La orden de compra del ingreso no coincide con la del producto seleccionado "
-                    f"({oc_catalogo or 'sin OC'}). Cree un nuevo producto en el catálogo "
-                    "con el mismo nombre y la nueva orden de compra, y selecciónelo para el ingreso."
-                )
+            if not clean_str(orden_compra):
+                st.error("⚠️ Registre la orden de compra correspondiente a esta recepción.")
                 return
             if not producto_activo_en_catalogo(data.get("Productos", pd.DataFrame()), producto_id):
                 st.error(
@@ -3401,22 +3396,9 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
                     "Reactive o cree el producto desde Catálogos antes de registrar el ingreso."
                 )
                 return
-            existe_lote, info_lote = producto_lote_ya_registrado(movimientos, producto_id, lote)
-            if existe_lote:
-                st.error(
-                    "⛔ Este producto/lote ya fue registrado en el Kardex. "
-                    "Para sumar más unidades al mismo lote use la opción "
-                    "'🔧 Ajuste (+) — Agregar unidades por conteo físico', no registre otro ingreso."
-                )
-                st.info(
-                    f"Resumen del lote existente: entrada {info_lote.get('entrada_total', 0):g}, "
-                    f"salida {info_lote.get('salida_total', 0):g}, "
-                    f"saldo {info_lote.get('saldo_actual', 0):g}. "
-                    f"Fecha ingreso: {info_lote.get('fecha_ingreso') or '—'} | "
-                    f"Proveedor: {info_lote.get('proveedor') or '—'} | "
-                    f"OC: {info_lote.get('orden_compra') or '—'}."
-                )
-                return
+            # Un mismo producto/lote puede recibirse varias veces, con órdenes distintas
+            # (o incluso con la misma OC cuando existen entregas parciales).
+            # Cada recepción tiene su movimiento_id independiente y suma existencias.
             set_confirm_pending(confirm_key_ingreso, {
                 "fecha": pd.to_datetime(fecha).strftime("%Y-%m-%d"),
                 "usuario": usuario,
@@ -3457,25 +3439,16 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             pay_lote = clean_str(_pay.get("lote", ""))
             _catalogo_actual = ensure_columns(data.get("Productos", pd.DataFrame()), "Productos")
             _fila_actual = _catalogo_actual[_catalogo_actual["producto_id"].astype(str).str.strip().eq(pay_producto_id)]
-            if _fila_actual.empty or producto_clave_catalogo("", _pay.get("orden_compra", ""))[1] != producto_clave_catalogo("", _fila_actual.iloc[0].get("orden_compra", ""))[1]:
-                st.error("La orden de compra ya no coincide con la ficha del producto. Revise el catálogo.")
+            if _fila_actual.empty:
+                st.error("El producto seleccionado ya no existe en el catálogo.")
+                return
+            if not clean_str(_pay.get("orden_compra", "")):
+                st.error("Debe indicar la orden de compra de este ingreso.")
                 return
             if not producto_activo_en_catalogo(data.get("Productos", pd.DataFrame()), pay_producto_id):
                 st.error(
                     "⛔ No se guardó el ingreso porque el producto ya no está activo en catálogo. "
                     "Reactive o cree el producto desde Catálogos antes de registrar el ingreso."
-                )
-                return
-            existe_lote, info_lote = producto_lote_ya_registrado(movimientos, pay_producto_id, pay_lote)
-            if existe_lote:
-                st.error(
-                    "⛔ No se guardó el ingreso porque este producto/lote ya existe. "
-                    "Use Corrección entrada / Ajuste (+) para sumar cantidad al mismo lote."
-                )
-                st.info(
-                    f"Resumen del lote existente: entrada {info_lote.get('entrada_total', 0):g}, "
-                    f"salida {info_lote.get('salida_total', 0):g}, "
-                    f"saldo {info_lote.get('saldo_actual', 0):g}."
                 )
                 return
             row = {
@@ -3501,7 +3474,7 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
                 "acta_entrega_id": "",
             }
             storage.append_row("Movimientos", row)
-            _sync_after_save([row], "Ingreso guardado correctamente. El formulario quedó limpio y el Kardex consolidado fue actualizado.")
+            _sync_after_save([row], "Nueva recepción guardada. Se conservaron el producto_id y el lote; la orden de compra quedó registrada en este movimiento.")
         return
 
     # ========================================================
@@ -4497,7 +4470,7 @@ def producto_duplicado_catalogo(df: pd.DataFrame, nombre: str, orden: str,
     for _, fila in productos.iterrows():
         if excluir_id and clean_str(fila.get("producto_id", "")) == excluir_id:
             continue
-        if producto_clave_catalogo(fila.get("nombre_producto", ""), fila.get("orden_compra", "")) == clave:
+        if producto_clave_catalogo(fila.get("nombre_producto", ""), "")[0] == clave[0]:
             return fila
     return None
 
@@ -4521,7 +4494,7 @@ def seleccionar_producto_tres_columnas(catalogo: pd.DataFrame, prefijo: str,
     # Código y nombre no necesariamente son únicos: añadir ID hace la selección inequívoca.
     etiquetas_codigo = {pid: f"{id_cod[pid] or 'Sin código'} | {pid}" for pid in ids}
     etiquetas_nombre = {
-        pid: f"{id_nom[pid] or 'Sin nombre'} | OC: {id_oc[pid] or 'Sin OC'} | {pid}"
+        pid: f"{id_nom[pid] or 'Sin nombre'} | {pid}"
         for pid in ids
     }
     todos = "Todos" if permitir_todos else "Seleccione un producto"
@@ -4564,10 +4537,10 @@ def seleccionar_producto_tres_columnas(catalogo: pd.DataFrame, prefijo: str,
 
 def save_new_product(storage, data, values: dict) -> None:
     df = ensure_columns(storage.load("Productos"), "Productos")
-    if not clean_str(values.get("nombre_producto", "")) or not clean_str(values.get("orden_compra", "")):
-        raise ValueError("Nombre y orden de compra son obligatorios.")
+    if not clean_str(values.get("nombre_producto", "")):
+        raise ValueError("El nombre del producto es obligatorio.")
     if producto_duplicado_catalogo(df, values["nombre_producto"], values["orden_compra"]) is not None:
-        raise ValueError("El producto con ese nombre y orden de compra ya existe.")
+        raise ValueError("Ya existe un producto con ese nombre. Selecciónelo en Ingreso para registrar una nueva orden de compra.")
     row = {
         "producto_id": next_code("PRD", df, "producto_id", 4),
         **values,
@@ -4576,13 +4549,13 @@ def save_new_product(storage, data, values: dict) -> None:
 
 
 def product_form(storage, data: Dict[str, pd.DataFrame]) -> None:
-    card_start("Nuevo producto", "La identidad única se determina por nombre y orden de compra.")
+    card_start("Nuevo producto", "El catálogo identifica el artículo. Las órdenes de compra se registran en cada ingreso.")
     confirm_key = "crear_producto_catalogo"
     with st.form("frm_producto", clear_on_submit=True):
         c1, c2 = st.columns([1, 2])
         codigo = c1.text_input("Código interno", placeholder="Ejemplo: HIV-RAP-001")
         nombre = c2.text_input("Nombre del producto *", placeholder="Nombre completo del reactivo o insumo")
-        orden_compra_producto = st.text_input("Orden de compra *", placeholder="Ejemplo: OC-2026-001", help="Un mismo nombre con otra orden de compra corresponde a otro producto.")
+        orden_compra_producto = st.text_input("Orden de compra histórica (opcional)", placeholder="Dejar vacío si se trata de un producto nuevo", help="La orden de cada recepción se escribe en Registrar movimientos → Ingreso.")
         c3, c4, c5 = st.columns(3)
         categoria = c3.selectbox("Categoría", CATEGORIAS_DEFAULT)
         marca = c4.text_input("Marca predeterminada")
@@ -4594,12 +4567,12 @@ def product_form(storage, data: Dict[str, pd.DataFrame]) -> None:
         observacion = st.text_area("Observación")
         submitted = st.form_submit_button("➕ Guardar producto", use_container_width=True)
     if submitted:
-        if not clean_str(nombre) or not clean_str(orden_compra_producto):
-            st.error("El nombre del producto y la orden de compra son obligatorios.")
+        if not clean_str(nombre):
+            st.error("El nombre del producto es obligatorio.")
             return
         duplicado = producto_duplicado_catalogo(data.get("Productos", pd.DataFrame()), nombre, orden_compra_producto)
         if duplicado is not None:
-            st.error(f"Este producto ya existe con la misma orden de compra. ID existente: {clean_str(duplicado.get('producto_id', ''))}. No se permite duplicarlo.")
+            st.error(f"Ya existe un producto con ese nombre. Para una nueva orden de compra, vaya a Ingreso. ID existente: {clean_str(duplicado.get('producto_id', ''))}. No se permite duplicarlo.")
             return
         set_confirm_pending(confirm_key, {
             "codigo_producto": codigo or nombre[:18].upper().replace(" ", "-"),
@@ -4642,7 +4615,7 @@ def product_form(storage, data: Dict[str, pd.DataFrame]) -> None:
         catalogo_actual = storage.load("Productos")
         duplicado = producto_duplicado_catalogo(catalogo_actual, payload.get("nombre_producto", ""), payload.get("orden_compra", ""))
         if duplicado is not None:
-            st.error(f"Ya existe el producto con la misma orden de compra (ID: {clean_str(duplicado.get('producto_id', ''))}).")
+            st.error(f"Ya existe un producto con ese nombre (ID: {clean_str(duplicado.get('producto_id', ''))}).")
             return
         save_new_product(storage, data, payload)
         set_flash("Producto guardado correctamente. El formulario quedó limpio para registrar un nuevo producto.")
@@ -5075,12 +5048,12 @@ def catalog_editor(storage, data: Dict[str, pd.DataFrame], sheet: str, title: st
             if sheet == "Productos":
                 nuevo_nombre = clean_str(values.get("nombre_producto", ""))
                 nueva_orden = clean_str(values.get("orden_compra", ""))
-                if not nuevo_nombre or not nueva_orden:
-                    st.error("Nombre y orden de compra son obligatorios para editar un producto. Complete primero la orden de compra del registro antiguo.")
+                if not nuevo_nombre:
+                    st.error("El nombre es obligatorio para editar un producto.")
                     return
                 choque = producto_duplicado_catalogo(df, nuevo_nombre, nueva_orden, registro_id)
                 if choque is not None:
-                    st.error(f"Ya existe otro producto con el mismo nombre y orden de compra (ID: {clean_str(choque.get('producto_id', ''))}).")
+                    st.error(f"Ya existe otro producto con el mismo nombre (ID: {clean_str(choque.get('producto_id', ''))}).")
                     return
             for col, new_value in values.items():
                 old_value = clean_str(new_df.loc[mask, col].iloc[0]) if col in new_df.columns else ""
