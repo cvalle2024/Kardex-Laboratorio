@@ -3552,17 +3552,65 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             axis=1,
         )
 
-        # ── Selector de producto FUERA del form → rerun inmediato al cambiar ──
-        productos_lista = ["Todos"] + sorted(disponibles["producto"].dropna().astype(str).unique().tolist())
-        filtro_producto = st.selectbox(
-            "Producto",
-            productos_lista,
-            key="sel_producto_carrito",
+        # Dos formas sincronizadas de encontrar el mismo producto:
+        # columna 1 = producto_id; columna 2 = nombre del producto.
+        # Se filtran lotes por ID para evitar confundir nombres repetidos.
+        catalogo_selector = (
+            disponibles[["producto_id", "producto"]]
+            .fillna("")
+            .astype(str)
+            .apply(lambda col: col.str.strip())
         )
+        catalogo_selector = catalogo_selector[
+            catalogo_selector["producto_id"].ne("")
+        ].drop_duplicates(subset=["producto_id"]).sort_values(["producto", "producto_id"])
+        id_a_nombre = dict(zip(catalogo_selector["producto_id"], catalogo_selector["producto"]))
+        # Si dos IDs tienen el mismo nombre, se incluye el ID al mostrarlo.
+        nombres_repetidos = catalogo_selector["producto"].value_counts()
+        id_a_etiqueta = {
+            pid: (f"{nombre} ({pid})" if nombres_repetidos.get(nombre, 0) > 1 else nombre)
+            for pid, nombre in id_a_nombre.items()
+        }
+        etiqueta_a_id = {etiqueta: pid for pid, etiqueta in id_a_etiqueta.items()}
+        ids_opciones = ["Todos"] + sorted(id_a_nombre)
+        nombres_opciones = ["Todos"] + sorted(etiqueta_a_id, key=str.casefold)
+
+        if st.session_state.get("sel_producto_id_carrito") not in ids_opciones:
+            st.session_state["sel_producto_id_carrito"] = "Todos"
+        if st.session_state.get("sel_producto_carrito") not in nombres_opciones:
+            st.session_state["sel_producto_carrito"] = "Todos"
+
+        def _sincronizar_desde_id():
+            seleccionado = st.session_state["sel_producto_id_carrito"]
+            st.session_state["sel_producto_carrito"] = id_a_etiqueta.get(seleccionado, "Todos")
+
+        def _sincronizar_desde_nombre():
+            seleccionado = st.session_state["sel_producto_carrito"]
+            st.session_state["sel_producto_id_carrito"] = etiqueta_a_id.get(seleccionado, "Todos")
+
+        col_id_producto, col_nombre_producto = st.columns(2)
+        with col_id_producto:
+            filtro_producto_id = st.selectbox(
+                "producto_id",
+                ids_opciones,
+                key="sel_producto_id_carrito",
+                on_change=_sincronizar_desde_id,
+                help="Busque el producto por su identificador único.",
+            )
+        with col_nombre_producto:
+            st.selectbox(
+                "Producto",
+                nombres_opciones,
+                key="sel_producto_carrito",
+                on_change=_sincronizar_desde_nombre,
+                help="Busque por nombre; el producto_id se actualizará automáticamente.",
+            )
 
         lotes_view = disponibles.copy()
-        if filtro_producto != "Todos":
-            lotes_view = lotes_view[lotes_view["producto"].astype(str) == filtro_producto]
+        if filtro_producto_id != "Todos":
+            lotes_view = lotes_view[
+                lotes_view["producto_id"].astype(str).str.strip() == filtro_producto_id
+            ]
 
         # Mostrar info del lote seleccionado antes del form
         lotes_opciones = lotes_view["label"].tolist()
