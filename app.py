@@ -3640,9 +3640,30 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             cart = st.session_state.get("salida_cart", [])
             if cart:
                 st.markdown("#### 2) Productos seleccionados para la salida")
-                cart_df = pd.DataFrame(cart).drop(columns=["item_key"], errors="ignore")
+                # Proyección visual: no modifica el carrito ni el inventario real.
+                cart_df = pd.DataFrame(cart).copy()
+                cart_df["cantidad"] = pd.to_numeric(cart_df["cantidad"], errors="raise")
+                cart_df["stock_disponible"] = pd.to_numeric(cart_df["stock_disponible"], errors="raise")
+                cantidad_acumulada = cart_df.groupby("item_key")["cantidad"].transform("sum")
+                cart_df["stock_restante"] = cart_df["stock_disponible"] - cantidad_acumulada
+                cart_df = cart_df.drop(columns=["item_key"], errors="ignore")
                 cart_df.insert(0, "item_no", range(1, len(cart_df) + 1))
-                st.dataframe(cart_df, use_container_width=True, hide_index=True)
+                st.dataframe(
+                    cart_df, use_container_width=True, hide_index=True,
+                    column_config={
+                        "item_no": "N°",
+                        "cantidad": st.column_config.NumberColumn("Cantidad de salida", format="%.2f"),
+                        "stock_disponible": st.column_config.NumberColumn("Stock actual", format="%.2f"),
+                        "stock_restante": st.column_config.NumberColumn(
+                            "Stock restante proyectado", format="%.2f",
+                            help="Saldo del lote después de descontar todas sus cantidades en el carrito."
+                        ),
+                    },
+                )
+                if (cart_df["stock_restante"] < 0).any():
+                    st.error("La cantidad solicitada supera el stock disponible.")
+                elif (cart_df["stock_restante"] == 0).any():
+                    st.warning("Uno o varios lotes quedarán sin existencias después de confirmar la salida.")
                 r1, r2 = st.columns([1, 2])
                 quitar = r1.selectbox("Quitar item", [""] + [str(i) for i in range(1, len(cart) + 1)])
                 if r2.button("🗑️ Quitar del carrito", use_container_width=True, disabled=(not quitar)):
