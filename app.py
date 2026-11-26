@@ -458,6 +458,21 @@ def format_date(value) -> str:
     return dt.strftime("%Y-%m-%d")
 
 
+def fecha_lote_na(value) -> str:
+    """Clave estable para lotes sin vencimiento, incluso en registros históricos."""
+    texto = clean_str(value)
+    if texto.upper() in ("", "N/A", "NA", "NAN", "NAT", "NONE", "#N/A"):
+        return "N/A"
+    return format_date(value)
+
+
+def fecha_opcional_iso(value, anterior=None) -> str:
+    """Mantiene una fecha ausente como N/A sin inventar una fecha de calendario."""
+    if value is None:
+        return "" if anterior == "" else "N/A"
+    return date_a_iso(value)
+
+
 def fecha_a_date(value):
     """Convierte texto/Timestamp a datetime.date (o None) para usar en st.date_input."""
     dt = pd.to_datetime(value, errors="coerce", format="mixed")
@@ -720,7 +735,8 @@ class LocalExcelStorage:
 
     def load(self, sheet: str) -> pd.DataFrame:
         try:
-            df = pd.read_excel(self.path, sheet_name=sheet, dtype=object)
+            df = pd.read_excel(self.path, sheet_name=sheet, dtype=object,
+                               keep_default_na=False if sheet in ("Movimientos", "Kardex_Consolidado") else True)
         except Exception:
             df = pd.DataFrame(columns=SHEET_COLUMNS[sheet])
         return ensure_columns(df, sheet)
@@ -1438,6 +1454,7 @@ def calcular_stock(df_mov: pd.DataFrame, df_prod: pd.DataFrame) -> pd.DataFrame:
     df["salida"] = np.where(df["mov_sign"] < 0, df["cantidad_num"], 0)
     df["costo_ingreso"] = np.where(df["mov_sign"] > 0, df["costo_total_num"], 0)
 
+    df["fecha_vencimiento"] = df["fecha_vencimiento"].map(fecha_lote_na)
     group_cols = ["producto_id", "producto", "marca", "lote", "fecha_vencimiento", "unidad"]
     stock = (
         df.groupby(group_cols, dropna=False, as_index=False)
@@ -1540,7 +1557,7 @@ def calcular_stock_desde_kardex_consolidado(df_kardex: pd.DataFrame, df_prod: pd
         "producto": kd["producto"],
         "marca": kd["marca"],
         "lote": kd["lote"],
-        "fecha_vencimiento": kd["fecha_vencimiento"],
+        "fecha_vencimiento": kd["fecha_vencimiento"].map(fecha_lote_na),
         "unidad": kd["unidad"],
         "ingreso_total": to_number(kd["entrada_total"]),
         "salida_total": to_number(kd["salida_total"]),
@@ -1646,6 +1663,7 @@ def calcular_kardex_consolidado(df_mov: pd.DataFrame, df_prod: pd.DataFrame) -> 
     df["entrada"] = np.where(df["mov_sign"] > 0, df["cantidad_num"], 0)
     df["salida"] = np.where(df["mov_sign"] < 0, df["cantidad_num"], 0)
 
+    df["fecha_vencimiento"] = df["fecha_vencimiento"].map(fecha_lote_na)
     group_cols = ["producto_id", "producto", "marca", "lote", "fecha_vencimiento", "unidad"]
     base = (
         df.groupby(group_cols, dropna=False, as_index=False)
@@ -3200,24 +3218,23 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
         stock_minimo = clean_str(prod_row.get("stock_minimo", "")) or "0"
         dias_alerta = clean_str(prod_row.get("dias_alerta_vencimiento", "")) or "0"
         obs = clean_str(prod_row.get("observacion", ""))
-        st.markdown(
+        st.html(
             f"""
             <div class="mini-card" style="border-color:rgba(56,189,248,.30); background:linear-gradient(180deg, rgba(8,47,73,.38), rgba(15,23,42,.70));">
-                <div class="mini-title">{titulo}</div>
-                <div style="color:#F8FAFC; font-size:18px; font-weight:900; margin:3px 0 8px 0;">{nombre}</div>
+                <div class="mini-title">{safe_html(titulo)}</div>
+                <div style="color:#F8FAFC; font-size:18px; font-weight:900; margin:3px 0 8px 0;">{safe_html(nombre)}</div>
                 <div style="display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:8px;">
-                    <div class="field-note"><b>Código</b><br>{codigo}</div>
-                    <div class="field-note"><b>OC histórica (catálogo)</b><br>{oc_ficha}</div>
-                    <div class="field-note"><b>Categoría</b><br>{categoria}</div>
-                    <div class="field-note"><b>Marca</b><br>{marca_default}</div>
-                    <div class="field-note"><b>Unidad</b><br>{unidad_default}</div>
-                    <div class="field-note"><b>Stock mínimo</b><br>{stock_minimo}</div>
-                    <div class="field-note"><b>Alerta venc.</b><br>{dias_alerta} días</div>
+                    <div class="field-note"><b>Código</b><br>{safe_html(codigo)}</div>
+                    <div class="field-note"><b>OC histórica (catálogo)</b><br>{safe_html(oc_ficha)}</div>
+                    <div class="field-note"><b>Categoría</b><br>{safe_html(categoria)}</div>
+                    <div class="field-note"><b>Marca</b><br>{safe_html(marca_default)}</div>
+                    <div class="field-note"><b>Unidad</b><br>{safe_html(unidad_default)}</div>
+                    <div class="field-note"><b>Stock mínimo</b><br>{safe_html(stock_minimo)}</div>
+                    <div class="field-note"><b>Alerta venc.</b><br>{safe_html(dias_alerta)} días</div>
                 </div>
-                {f'<div class="field-note" style="margin-top:10px;"><b>Observación:</b> {obs}</div>' if obs else ''}
+                {f'<div class="field-note" style="margin-top:10px;"><b>Observación:</b> {safe_html(obs)}</div>' if obs else ''}
             </div>
             """,
-            unsafe_allow_html=True,
         )
 
     def _sync_after_save(rows: list[dict], message: str) -> None:
@@ -3359,8 +3376,10 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             lote = b.text_input("Lote *", placeholder="Ejemplo: AB-2026-001")
             unidad = c.selectbox("Unidad", unidades, index=unidad_index)
             d, e, f = st.columns(3)
-            fecha_elaboracion_dt = d.date_input("Fecha de elaboración", value=TODAY.date())
-            fecha_vencimiento_dt = e.date_input("Fecha de vencimiento", value=(TODAY + pd.Timedelta(days=365)).date())
+            fecha_elaboracion_dt = d.date_input("Fecha de elaboración", value=None, help="Seleccione la fecha real. Si queda vacía o marca N/A, se guardará N/A.")
+            sin_elaboracion = d.checkbox("N/A — Elaboración", help="No aplica o no se dispone de la fecha. Tiene prioridad sobre el calendario.")
+            fecha_vencimiento_dt = e.date_input("Fecha de vencimiento", value=None, help="Seleccione la fecha real. Si queda vacía o marca N/A, se guardará N/A.")
+            sin_vencimiento = e.checkbox("N/A — Vencimiento", help="No aplica o no se dispone de la fecha. Tiene prioridad sobre el calendario.")
             costo_total = f.number_input("Costo total", min_value=0.0, step=1.0, format="%.2f")
 
             st.markdown(
@@ -3409,8 +3428,8 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
                 "proveedor": proveedor,
                 "orden_compra": orden_compra,
                 "personal": personal,
-                "fecha_elaboracion": fecha_elaboracion_dt.strftime("%Y-%m-%d"),
-                "fecha_vencimiento": fecha_vencimiento_dt.strftime("%Y-%m-%d"),
+                "fecha_elaboracion": fecha_opcional_iso(None if sin_elaboracion else fecha_elaboracion_dt),
+                "fecha_vencimiento": fecha_opcional_iso(None if sin_vencimiento else fecha_vencimiento_dt),
                 "unidad": unidad,
                 "cantidad": cantidad,
                 "costo_total": costo_total,
@@ -3683,21 +3702,20 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
 
         # Mostrar tarjeta del encargado si ya seleccionó un sitio
         if solicitante and responsable_auto:
-            st.markdown(
+            st.html(
                 f"""<div style="border:1px solid rgba(56,189,248,.25); border-radius:14px; padding:12px 16px;
                                 margin:4px 0 12px 0; background:rgba(56,189,248,.06); display:flex; gap:16px; flex-wrap:wrap;">
                     <div style="font-size:13px;">
                         <span style="color:#64748B; font-size:11px; text-transform:uppercase; letter-spacing:.06em;">Encargado del sitio</span><br>
-                        <b style="color:#F8FAFC; font-size:15px;">👤 {responsable_auto}</b>
+                        <b style="color:#F8FAFC; font-size:15px;">👤 {safe_html(responsable_auto)}</b>
                     </div>
                     <div style="font-size:13px;">
                         <span style="color:#64748B; font-size:11px; text-transform:uppercase; letter-spacing:.06em;">Cargo</span><br>
-                        <b style="color:#CBD5E1;">{cargo_auto}</b>
+                        <b style="color:#CBD5E1;">{safe_html(cargo_auto)}</b>
                     </div>
-                    {"" if not dpto_auto else f'<div style="font-size:13px;"><span style="color:#64748B; font-size:11px; text-transform:uppercase; letter-spacing:.06em;">Departamento</span><br><b style="color:#CBD5E1;">{dpto_auto}</b></div>'}
-                    {"" if not tel_auto else f'<div style="font-size:13px;"><span style="color:#64748B; font-size:11px; text-transform:uppercase; letter-spacing:.06em;">Teléfono</span><br><b style="color:#CBD5E1;">{tel_auto}</b></div>'}
+                    {"" if not dpto_auto else f'<div style="font-size:13px;"><span style="color:#64748B; font-size:11px; text-transform:uppercase; letter-spacing:.06em;">Departamento</span><br><b style="color:#CBD5E1;">{safe_html(dpto_auto)}</b></div>'}
+                    {"" if not tel_auto else f'<div style="font-size:13px;"><span style="color:#64748B; font-size:11px; text-transform:uppercase; letter-spacing:.06em;">Teléfono</span><br><b style="color:#CBD5E1;">{safe_html(tel_auto)}</b></div>'}
                 </div>""",
-                unsafe_allow_html=True,
             )
         elif solicitante and not responsable_auto:
             st.markdown(
@@ -3950,7 +3968,7 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
                 "solicitante": quien_devuelve,
                 "personal": personal,
                 "fecha_elaboracion": clean_str(salida_row.get("fecha_elaboracion", "")),
-                "fecha_vencimiento": format_date(salida_row.get("fecha_vencimiento", "")),
+                "fecha_vencimiento": fecha_lote_na(salida_row.get("fecha_vencimiento", "")),
                 "unidad": clean_str(salida_row["unidad"]),
                 "cantidad": cantidad,
                 "costo_total": 0,
@@ -5281,51 +5299,50 @@ def render_movement_crud_controls(storage, data: Dict[str, pd.DataFrame]) -> Non
     pers_val  = clean_str(selected.get("personal", ""))
     extra_label = ""
     if tipo_mov == "Ingreso":
-        extra_label = f"<b>Proveedor:</b> {prov_val or '—'}"
+        extra_label = f"<b>Proveedor:</b> {safe_html(prov_val or '—')}"
     elif tipo_mov in ("Salida", "Devolución"):
-        extra_label = f"<b>Sitio/unidad:</b> {solic_val or '—'} &nbsp;|&nbsp; <b>Personal:</b> {pers_val or '—'}"
+        extra_label = f"<b>Sitio/unidad:</b> {safe_html(solic_val or '—')} &nbsp;|&nbsp; <b>Personal:</b> {safe_html(pers_val or '—')}"
     elif tipo_mov in ("Corrección entrada", "Corrección salida"):
-        extra_label = f"<b>Observación:</b> {clean_str(selected.get('observacion', ''))[:60]}"
+        extra_label = f"<b>Observación:</b> {safe_html(selected.get('observacion', ''))[:60]}"
 
-    st.markdown(
+    st.html(
         f"""
         <div style="border:1px solid {color_estado}33; border-radius:18px; padding:16px 20px; margin:12px 0;
                     background:linear-gradient(135deg,rgba(15,23,42,.90),rgba(2,6,23,.80));">
             <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:12px;">
                 <span style="font-size:22px;">{icono_tipo}</span>
-                <span style="font-size:18px; font-weight:900; color:#F8FAFC;">{mov_id}</span>
+                <span style="font-size:18px; font-weight:900; color:#F8FAFC;">{safe_html(mov_id)}</span>
                 <span style="padding:3px 12px; border-radius:999px; background:{color_estado}22;
                              color:{color_estado}; border:1px solid {color_estado}55; font-size:12px; font-weight:700;">
-                    {est_mov}
+                    {safe_html(est_mov)}
                 </span>
                 <span style="padding:3px 12px; border-radius:999px; background:rgba(56,189,248,.15);
                              color:#38BDF8; border:1px solid rgba(56,189,248,.30); font-size:12px;">
-                    {tipo_mov}
+                    {safe_html(tipo_mov)}
                 </span>
             </div>
             <div style="display:grid; grid-template-columns:repeat(4,1fr); gap:12px;">
                 <div style="font-size:12px; color:#94A3B8;">
                     <b style="color:#E5E7EB; display:block; margin-bottom:2px;">Producto</b>
-                    {clean_str(selected.get('producto',''))}
+                    {safe_html(selected.get('producto',''))}
                 </div>
                 <div style="font-size:12px; color:#94A3B8;">
                     <b style="color:#E5E7EB; display:block; margin-bottom:2px;">Lote</b>
-                    {clean_str(selected.get('lote',''))}
+                    {safe_html(selected.get('lote',''))}
                 </div>
                 <div style="font-size:12px; color:#94A3B8;">
                     <b style="color:#E5E7EB; display:block; margin-bottom:2px;">Cantidad registrada</b>
                     <span style="font-size:20px; font-weight:900; color:#38BDF8;">{cant_actual:g}</span>
-                    <span style="color:#64748B;"> {clean_str(selected.get('unidad',''))}</span>
+                    <span style="color:#64748B;"> {safe_html(selected.get('unidad',''))}</span>
                 </div>
                 <div style="font-size:12px; color:#94A3B8;">
                     <b style="color:#E5E7EB; display:block; margin-bottom:2px;">Fecha</b>
-                    {clean_str(selected.get('fecha',''))}
+                    {safe_html(selected.get('fecha',''))}
                 </div>
             </div>
             {f'<div style="margin-top:10px; font-size:12px; color:#94A3B8; border-top:1px solid rgba(148,163,184,.15); padding-top:10px;">{extra_label}</div>' if extra_label else ''}
         </div>
         """,
-        unsafe_allow_html=True,
     )
 
     # ── 4. TABS DE ACCIÓN ──────────────────────────────────────────────────
@@ -5413,14 +5430,14 @@ def render_movement_crud_controls(storage, data: Dict[str, pd.DataFrame]) -> Non
 
                     st.markdown("##### 📅 Fechas del lote")
                     f1, f2 = st.columns(2)
-                    nueva_elab = date_a_iso(f1.date_input(
+                    nueva_elab = fecha_opcional_iso(f1.date_input(
                         "Fecha de elaboración", value=fecha_a_date(val_elab),
-                        help="Seleccione la fecha. Déjela vacía si no aplica.",
-                    ))
-                    nueva_venc = date_a_iso(f2.date_input(
+                        help="Seleccione la fecha o borre el calendario si no aplica.",
+                    ), anterior=val_elab)
+                    nueva_venc = fecha_opcional_iso(f2.date_input(
                         "Fecha de vencimiento", value=fecha_a_date(val_venc),
-                        help="Al cambiarla se recalcula el estado y los días para vencer del lote.",
-                    ))
+                        help="Borre el calendario si no aplica. Al cambiarla se recalcula el estado del lote.",
+                    ), anterior=val_venc)
 
                     st.markdown("##### 🏭 Proveedor y logística")
                     d1, d2 = st.columns(2)
@@ -5456,7 +5473,7 @@ def render_movement_crud_controls(storage, data: Dict[str, pd.DataFrame]) -> Non
                         nuevo_lote  = e1.text_input("Lote", value=val_lote)
                         nueva_marca = e2.text_input("Marca", value=val_marca)
                         e3, e4 = st.columns(2)
-                        nueva_venc = date_a_iso(e3.date_input("Fecha de vencimiento", value=fecha_a_date(val_venc), help="Debe coincidir con el lote del que salió el producto."))
+                        nueva_venc = fecha_opcional_iso(e3.date_input("Fecha de vencimiento", value=fecha_a_date(val_venc), help="Debe coincidir con el lote del que salió el producto."), anterior=val_venc)
                         nuevo_oc   = e4.text_input("Orden de compra", value=val_oc, help="Aparece en el acta de entrega.")
                     new_values = {
                         "cantidad": nueva_cantidad, "fecha": nueva_fecha,
@@ -5481,7 +5498,7 @@ def render_movement_crud_controls(storage, data: Dict[str, pd.DataFrame]) -> Non
                         e1, e2 = st.columns(2)
                         nuevo_lote  = e1.text_input("Lote", value=val_lote)
                         nueva_marca = e2.text_input("Marca", value=val_marca)
-                        nueva_venc = date_a_iso(st.date_input("Fecha de vencimiento", value=fecha_a_date(val_venc), help="Debe coincidir con el lote devuelto."))
+                        nueva_venc = fecha_opcional_iso(st.date_input("Fecha de vencimiento", value=fecha_a_date(val_venc), help="Debe coincidir con el lote devuelto."), anterior=val_venc)
                     new_values = {
                         "cantidad": nueva_cantidad, "fecha": nueva_fecha,
                         "solicitante": nuevo_solic, "personal": nuevo_pers,
@@ -5498,7 +5515,7 @@ def render_movement_crud_controls(storage, data: Dict[str, pd.DataFrame]) -> Non
                     )
                     with st.expander("✏️ Corregir fecha de vencimiento del lote"):
                         st.caption("La fecha de vencimiento debe coincidir con el lote afectado.")
-                        nueva_venc = date_a_iso(st.date_input("Fecha de vencimiento", value=fecha_a_date(val_venc), help="Seleccione la fecha en el calendario."))
+                        nueva_venc = fecha_opcional_iso(st.date_input("Fecha de vencimiento", value=fecha_a_date(val_venc), help="Seleccione la fecha en el calendario."), anterior=val_venc)
                     new_values = {
                         "cantidad": nueva_cantidad, "fecha": nueva_fecha,
                         "observacion": nueva_obs,
