@@ -439,23 +439,40 @@ def to_number(series, default: float = 0) -> pd.Series:
     return pd.to_numeric(series, errors="coerce").fillna(default)
 
 
+def parse_fecha(value):
+    """Interpreta ISO, fechas DD/MM/AAAA y seriales Excel/Google Sheets.
+
+    Conserva horas cuando existen; no convierte N/A ni valores inválidos en
+    fechas ficticias. Los seriales se interpretan con origen 1899-12-30.
+    """
+    texto = clean_str(value)
+    if texto.upper() in ("", "N/A", "NA", "NAN", "NAT", "NONE", "#N/A"):
+        return pd.NaT
+    try:
+        if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", texto):
+            serial = float(texto)
+            # Rango razonable de fechas de inventario: 1954 a 2173.
+            # Evita interpretar años sueltos o identificadores como fechas.
+            if 20000 <= serial < 100000:
+                return pd.to_datetime(serial, unit="D", origin="1899-12-30", errors="coerce").round("us")
+            return pd.NaT
+        # Formato local explícito; nunca invertir mes/día en fechas ISO.
+        if re.fullmatch(r"\d{1,2}/\d{1,2}/\d{4}", texto):
+            return pd.to_datetime(texto, format="%d/%m/%Y", errors="coerce")
+        return pd.to_datetime(value, errors="coerce", format="mixed")
+    except (ValueError, TypeError, OverflowError):
+        return pd.NaT
+
+
 def to_date(series) -> pd.Series:
-    # IMPORTANTE: NO usar dayfirst=True. En pandas reciente eso invierte las fechas
-    # ISO (AAAA-MM-DD) cuando día y mes son ambos <=12 (ej. 2026-10-05 se leía como
-    # 10 de mayo), provocando estados "Vencido" incorrectos. El formato canónico de la
-    # app es ISO (los date_input lo generan), y format="mixed" lo interpreta bien.
-    return pd.to_datetime(series, errors="coerce", format="mixed")
+    return pd.to_datetime(series.map(parse_fecha), errors="coerce")
 
 
 def format_date(value) -> str:
     if pd.isna(value) or value == "":
         return ""
-    # Usa la misma interpretación que to_date (sin dayfirst) para que lo que se
-    # MUESTRA coincida siempre con lo que se CALCULA (días para vencer/estado).
-    dt = pd.to_datetime(value, errors="coerce", format="mixed")
-    if pd.isna(dt):
-        return clean_str(value)
-    return dt.strftime("%Y-%m-%d")
+    dt = parse_fecha(value)
+    return clean_str(value) if pd.isna(dt) else dt.strftime("%Y-%m-%d")
 
 
 def fecha_lote_na(value) -> str:
@@ -474,19 +491,15 @@ def fecha_opcional_iso(value, anterior=None) -> str:
 
 
 def fecha_a_date(value):
-    """Convierte texto/Timestamp a datetime.date (o None) para usar en st.date_input."""
-    dt = pd.to_datetime(value, errors="coerce", format="mixed")
+    """Convierte fechas históricas o seriales a date para st.date_input."""
+    dt = parse_fecha(value)
     return dt.date() if pd.notna(dt) else None
 
 
 def date_a_iso(value) -> str:
-    """Convierte un valor de fecha (date/Timestamp/texto) a string ISO YYYY-MM-DD."""
-    if value in (None, ""):
-        return ""
-    try:
-        return pd.to_datetime(value).strftime("%Y-%m-%d")
-    except Exception:
-        return ""
+    """Convierte una fecha válida a ISO YYYY-MM-DD."""
+    dt = parse_fecha(value)
+    return dt.strftime("%Y-%m-%d") if pd.notna(dt) else ""
 
 
 def active_mask(df: pd.DataFrame, col: str = "activo") -> pd.Series:
@@ -686,6 +699,9 @@ def diagnose_gsheets_error(exc: Exception) -> str:
 
 def normalize_for_sheet(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    for col in ("fecha_elaboracion", "fecha_vencimiento"):
+        if col in df.columns:
+            df[col] = df[col].map(format_date)
     for col in df.columns:
         if pd.api.types.is_datetime64_any_dtype(df[col]):
             df[col] = df[col].dt.strftime("%Y-%m-%d")
@@ -1455,6 +1471,7 @@ def calcular_stock(df_mov: pd.DataFrame, df_prod: pd.DataFrame) -> pd.DataFrame:
     df["costo_ingreso"] = np.where(df["mov_sign"] > 0, df["costo_total_num"], 0)
 
     df["fecha_vencimiento"] = df["fecha_vencimiento"].map(fecha_lote_na)
+    df["fecha_elaboracion"] = df["fecha_elaboracion"].map(format_date)
     group_cols = ["producto_id", "producto", "marca", "lote", "fecha_vencimiento", "unidad"]
     stock = (
         df.groupby(group_cols, dropna=False, as_index=False)
@@ -1664,6 +1681,7 @@ def calcular_kardex_consolidado(df_mov: pd.DataFrame, df_prod: pd.DataFrame) -> 
     df["salida"] = np.where(df["mov_sign"] < 0, df["cantidad_num"], 0)
 
     df["fecha_vencimiento"] = df["fecha_vencimiento"].map(fecha_lote_na)
+    df["fecha_elaboracion"] = df["fecha_elaboracion"].map(format_date)
     group_cols = ["producto_id", "producto", "marca", "lote", "fecha_vencimiento", "unidad"]
     base = (
         df.groupby(group_cols, dropna=False, as_index=False)
@@ -2638,7 +2656,7 @@ def spanish_month_name(month: int) -> str:
 
 
 def fecha_larga_es(value) -> str:
-    dt = pd.to_datetime(value, errors="coerce")
+    dt = parse_fecha(value)
     if pd.isna(dt):
         dt = TODAY
     return f"{dt.day} de {spanish_month_name(dt.month)} de {dt.year}"
