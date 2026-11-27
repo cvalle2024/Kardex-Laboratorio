@@ -2822,15 +2822,14 @@ def join_spanish(items: list[str]) -> str:
         return ""
     if len(items) == 1:
         return items[0]
-    if len(items) == 2:
-        return f"{items[0]} y {items[1]}"
-    return f"{', '.join(items[:-1])} y {items[-1]}"
+    conj = "e" if items[-1].lower().startswith(("i", "hi")) else "y"
+    return f"{', '.join(items[:-1])} {conj} {items[-1]}"
 
 
 def categoria_acta_plural(categoria: str) -> str:
     """Convierte la categoría del catálogo en el texto que se imprime en el acta."""
     cat = clean_str(categoria).strip().lower()
-    if not cat:
+    if not cat or cat in {"n/a", "na", "nan", "sin categoría", "sin categoria"}:
         return "productos"
 
     # Normalización flexible por si el catálogo tiene variantes escritas por usuarios.
@@ -2840,10 +2839,10 @@ def categoria_acta_plural(categoria: str) -> str:
         return "insumos"
     if "equipo" in cat:
         return "equipos"
+    if "papeler" in cat:
+        return "artículos de papelería"
     if "material" in cat:
         return "materiales"
-    if "papeler" in cat:
-        return "materiales de papelería"
     if "medic" in cat or "fárm" in cat or "farm" in cat:
         return "medicamentos"
     if "control" in cat:
@@ -2864,19 +2863,28 @@ def acta_tipo_entrega_desde_categorias(rows: list[dict]) -> str:
     categorias = []
     for r in rows or []:
         categoria = clean_str(r.get("categoria", ""))
-        plural = categoria_acta_plural(categoria)
-        if plural and plural not in categorias:
-            categorias.append(plural)
+        for parte in re.split(r"[/;,]|\s+(?:y|e)\s+", categoria, flags=re.IGNORECASE):
+            plural = categoria_acta_plural(parte)
+            if plural not in categorias:
+                categorias.append(plural)
+    if "reactivos" in categorias:
+        categorias.remove("reactivos")
+        categorias.insert(0, "reactivos")
+    return join_spanish(categorias) or "productos"
 
-    if not categorias:
-        return "productos"
 
-    # Si hay demasiadas categorías, se usa una frase compacta para no saturar la redacción.
-    if len(categorias) > 4:
-        principales = categorias[:3]
-        return f"{join_spanish(principales)} y otros productos"
-
-    return join_spanish(categorias)
+def acta_parrafo_entrega(rows: list[dict], sitio: str, tipo_entrega_texto: str = "") -> str:
+    """Redacción institucional según las categorías reales del despacho."""
+    automatico = acta_tipo_entrega_desde_categorias(rows)
+    tipo = clean_str(tipo_entrega_texto) or automatico
+    es_reactivo = bool(re.search(r"\breactivos\b", automatico))
+    pruebas = "pruebas" if es_reactivo else "pruebas de VIH y/o infecciones oportunistas (IOs)"
+    return (
+        "En el marco de la cooperación técnica y el fortalecimiento continuo de la red diagnóstica "
+        "en Honduras, se formaliza mediante la presente acta la entrega de "
+        f"{tipo} destinados a garantizar la continuidad operativa, la oportunidad diagnóstica y el "
+        f"aseguramiento de la calidad en el procesamiento de {pruebas} en el {clean_str(sitio) or 'sitio receptor'}."
+    )
 
 
 def build_acta_entrega_pdf(
@@ -2899,7 +2907,7 @@ def build_acta_entrega_pdf(
     """
     try:
         from reportlab.lib import colors
-        from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+        from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT, TA_JUSTIFY
         from reportlab.lib.pagesizes import letter
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib.units import inch
@@ -2918,6 +2926,7 @@ def build_acta_entrega_pdf(
     )
     styles = getSampleStyleSheet()
     normal = ParagraphStyle("ActaNormal", parent=styles["Normal"], fontName="Helvetica", fontSize=10.5, leading=14, alignment=TA_LEFT)
+    cuerpo = ParagraphStyle("ActaCuerpo", parent=normal, alignment=TA_JUSTIFY)
     normal_center = ParagraphStyle("ActaCenter", parent=normal, alignment=TA_CENTER)
     normal_right = ParagraphStyle("ActaRight", parent=normal, alignment=TA_RIGHT)
     bold = ParagraphStyle("ActaBold", parent=normal, fontName="Helvetica-Bold")
@@ -2955,14 +2964,15 @@ def build_acta_entrega_pdf(
     story.append(Spacer(1, 0.20 * inch))
 
     story.append(Paragraph(
-        "Reciba un cordial saludo de parte del Programa Regional Centroamericano de VIH Asociado al "
-        "Centro de Estudios en Salud de la Universidad del Valle de Guatemala.", normal
+        "Reciba un cordial saludo del Programa Regional Centroamericano de VIH (VIHCA), asociado al "
+        "Centro de Estudios en Salud de la Universidad del Valle de Guatemala (UVG).", cuerpo
     ))
     story.append(Spacer(1, 0.12 * inch))
+    story.append(Paragraph(safe_html(acta_parrafo_entrega(salida_rows, sitio, tipo_entrega)), cuerpo))
+    story.append(Spacer(1, 0.12 * inch))
     story.append(Paragraph(
-        f"El motivo de la presente es para hacer de su conocimiento que como parte del apoyo que el "
-        f"Programa de VIH brinda en Honduras, se hace entrega formal de los siguientes {tipo_entrega} "
-        f"para el procesamiento y uso en {sitio}.", normal
+        "A continuación, se detalla el inventario entregado, verificado bajo los estándares de "
+        "integridad física, vigencia y condiciones de almacenamiento requeridas:", cuerpo
     ))
     story.append(Spacer(1, 0.24 * inch))
 
@@ -3804,9 +3814,11 @@ def page_movimiento(storage, data: Dict[str, pd.DataFrame], stock: pd.DataFrame)
             tipo_entrega_texto = st.text_input(
                 "Texto de categoría para el acta",
                 value=tipo_entrega_auto,
+                key=f"acta_categoria_{mov_nonce}_{tipo_entrega_auto}_{solicitante}",
                 help="Se calcula automáticamente según la categoría del producto en el catálogo. Puede ajustarlo antes de generar el PDF. Ejemplo: reactivos, insumos, equipos, materiales."
             )
-            st.caption(f"En el acta se imprimirá: 'se hace entrega formal de los siguientes {tipo_entrega_texto}...'")
+            st.caption("Redacción automática del acta (la categoría puede ajustarse antes de confirmar):")
+            st.text(acta_parrafo_entrega(cart, solicitante))
             generar_acta = st.checkbox("Generar acta de entrega en PDF", value=True)
             submitted = st.form_submit_button("📤 Solicitar salida →", use_container_width=True)
         st.markdown("</div>", unsafe_allow_html=True)
